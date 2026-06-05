@@ -1,0 +1,74 @@
+//! halter control plane: the agent→policy registry, short-lived token minting, the
+//! credential vault, and the audit sink. The data plane ([`gateway`]) holds an
+//! `Arc<ControlPlane>` and consults it on every request; the policy engine ([`policy`])
+//! never touches any of this — it stays pure.
+
+pub mod audit;
+pub mod credentials;
+pub mod registry;
+pub mod tokens;
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub use audit::{AuditSink, InMemoryAudit, TracingAudit};
+pub use credentials::{CredentialStore, InMemoryCredentials, Secret};
+pub use registry::Registry;
+pub use tokens::Tokens;
+
+/// Wall-clock time in Unix epoch milliseconds. The control-plane core takes time as a
+/// parameter for testability; this is the production source the binary passes in.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The assembled control plane. Each capability is an independent component; the
+/// credential store and audit sink are trait objects so they can be swapped without
+/// touching the data plane.
+pub struct ControlPlane {
+    pub registry: Registry,
+    pub tokens: Tokens,
+    pub credentials: Arc<dyn CredentialStore>,
+    pub audit: Arc<dyn AuditSink>,
+}
+
+impl ControlPlane {
+    /// Assemble a control plane from its components.
+    pub fn new(credentials: Arc<dyn CredentialStore>, audit: Arc<dyn AuditSink>) -> Self {
+        Self {
+            registry: Registry::new(),
+            tokens: Tokens::new(),
+            credentials,
+            audit,
+        }
+    }
+
+    /// A control plane with an in-memory credential store and a `tracing` audit sink —
+    /// the production default. The returned credential store handle lets the caller seed
+    /// secrets after construction.
+    pub fn with_defaults() -> (Self, Arc<InMemoryCredentials>) {
+        let credentials = Arc::new(InMemoryCredentials::new());
+        let plane = Self::new(credentials.clone(), Arc::new(TracingAudit));
+        (plane, credentials)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_ms_is_nonzero() {
+        assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn with_defaults_wires_components() {
+        let (plane, creds) = ControlPlane::with_defaults();
+        creds.insert("github-app", Secret::new("tok"));
+        assert!(plane.credentials.resolve("github-app").is_some());
+    }
+}

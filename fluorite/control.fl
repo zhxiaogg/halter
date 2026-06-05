@@ -1,0 +1,18 @@
+/// The control-plane wire API the orchestrator calls at agent launch to mint a
+/// short-lived capability token bound to the agent's standing policy.
+package control;
+
+/// Mint a launch token for an agent. Because policy is attached to the agent identity
+/// (Option 3), only the agent id and a TTL are needed.
+struct MintRequest {
+    agent: String,
+    ttl_seconds: u64,
+}
+
+/// A minted token. Honored only by the halter proxy and useless against the real
+/// upstream. The agent presents it; the proxy swaps in the real credential.
+struct MintResponse {
+    token: String,
+    agent: String,
+    expires_at_ms: u64,
+}

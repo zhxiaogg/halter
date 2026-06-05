@@ -1,0 +1,20 @@
+[package]
+name = "tests"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+# Test-support crate: no workspace restriction lints so helpers can use unwrap freely.
+
+[dependencies]
+models     = { workspace = true }
+policy     = { workspace = true }
+control    = { workspace = true }
+gateway    = { workspace = true }
+serde_json = { workspace = true }
+http       = { workspace = true }
+bytes      = { workspace = true }
+axum       = { workspace = true }
+reqwest    = { workspace = true }
+tokio      = { workspace = true }

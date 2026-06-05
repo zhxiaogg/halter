@@ -1,0 +1,39 @@
+/// The normalized, protocol-agnostic representation of one operation an agent attempts.
+/// The policy engine decides solely on an `Action`; each proxy adapter translates its
+/// native request (an HTTP call today, an Envoy ext_authz check tomorrow) into one.
+/// This is the portability boundary that lets the engine outlive any single proxy.
+package action;
+
+/// Which external system the action targets. Extended as new adapters land.
+enum Target {
+    Github,
+}
+
+/// The operation kind, abstracted over a protocol's concrete verbs (HTTP method, etc.).
+enum Verb {
+    Read,
+    Create,
+    Update,
+    Delete,
+}
+
+/// The resource an action addresses, parsed from the request by an adapter.
+struct Resource {
+    /// Canonical, slash-joined path with concrete identifiers, e.g.
+    /// "repos/octocat/hello-world/pulls". Rule globs match against this.
+    path: String,
+    /// Coarse resource class, e.g. "repo", "pull_request", "issue", "contents".
+    kind: String,
+}
+
+/// One normalized operation, the sole input to the policy engine.
+struct Action {
+    /// The agent on whose behalf the request is made (resolved from the halter token).
+    agent: String,
+    target: Target,
+    verb: Verb,
+    resource: Resource,
+    /// Selected request attributes (merged query + JSON body) for conditional rules,
+    /// as a JSON object, e.g. {"base":"main","draft":true}. Empty object if none.
+    fields: Any,
+}
