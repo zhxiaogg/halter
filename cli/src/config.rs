@@ -3,7 +3,6 @@
 //! protocol. It seeds the control plane (agents → policies, credential vault) and the
 //! gateway route at startup.
 
-use models::action::Target;
 use models::policy::Policy;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -15,8 +14,8 @@ pub struct Config {
     pub proxy_addr: String,
     /// Address the operator/orchestrator admin API listens on, e.g. `127.0.0.1:9091`.
     pub admin_addr: String,
-    /// The single upstream route (v1).
-    pub route: RouteConfig,
+    /// The upstream HTTPS services halter will proxy to (the allowlist). Routed by Host.
+    pub services: Vec<ServiceConfig>,
     /// Logical credential id → real secret. Provisioned out of band; never exposed to
     /// agents.
     #[serde(default)]
@@ -27,10 +26,16 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct RouteConfig {
-    pub target: Target,
+pub struct ServiceConfig {
+    /// Logical service name; becomes `Action.target` and what policy rules scope to.
+    pub name: String,
+    /// Host pattern matched against the request `Host`: exact, `*.suffix`, or `*`.
+    pub host: String,
     /// Upstream base URL, e.g. `https://api.github.com`.
     pub upstream_base: String,
+    /// Normalization flavor: "github" or "generic" (default).
+    #[serde(default)]
+    pub flavor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,7 +63,9 @@ mod tests {
         let json = r#"{
             "proxy_addr": "127.0.0.1:9090",
             "admin_addr": "127.0.0.1:9091",
-            "route": { "target": "Github", "upstream_base": "https://api.github.com" },
+            "services": [
+                { "name": "github", "host": "api.github.com", "upstream_base": "https://api.github.com", "flavor": "github" }
+            ],
             "credentials": { "github-app": "secret" },
             "agents": [
                 { "id": "agent-1", "policy": { "rules": [

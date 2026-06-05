@@ -100,6 +100,11 @@ async fn mint_handler(
 }
 
 /// Execute the planned upstream request and relay the response back to the agent.
+///
+/// The response body is **streamed**, never buffered, so Server-Sent Events, chunked
+/// responses, and long-polls flow through halter transparently. (The request body is
+/// buffered earlier because policy conditions may inspect it; responses have no such
+/// need.)
 async fn forward(client: &reqwest::Client, plan: ForwardPlan) -> Response {
     let mut builder = client.request(plan.method, &plan.url).headers(plan.headers);
     if !plan.body.is_empty() {
@@ -112,12 +117,9 @@ async fn forward(client: &reqwest::Client, plan: ForwardPlan) -> Response {
 
     let status = upstream.status();
     let headers = filter_response_headers(upstream.headers());
-    let bytes = match upstream.bytes().await {
-        Ok(b) => b,
-        Err(_) => return error_response(StatusCode::BAD_GATEWAY, "failed to read upstream body"),
-    };
+    let body = Body::from_stream(upstream.bytes_stream());
 
-    let mut response = Response::new(Body::from(bytes));
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response

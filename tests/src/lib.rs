@@ -7,8 +7,7 @@
 use axum::Router;
 use axum::extract::State;
 use control::{ControlPlane, InMemoryAudit, InMemoryCredentials, Secret};
-use gateway::{Gateway, Route, ServerState};
-use models::action::Target;
+use gateway::{Flavor, Gateway, ServerState, Service, ServiceRouter};
 use models::policy::Policy;
 use std::sync::{Arc, Mutex};
 
@@ -72,6 +71,17 @@ async fn record_handler(
         authorization,
         body: body.to_vec(),
     });
+    // SSE branch: any path containing "stream" returns a Server-Sent Events body, so
+    // tests can verify halter relays event streams (transport) end to end.
+    if parts.uri.path().contains("stream") {
+        let events = "data: one\n\ndata: two\n\ndata: three\n\n";
+        return axum::response::Response::builder()
+            .status(200)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from(events))
+            .unwrap();
+    }
+
     let payload = serde_json::json!({ "ok": true, "path": parts.uri.path() }).to_string();
     axum::response::Response::builder()
         .status(200)
@@ -119,18 +129,24 @@ impl Harness {
     }
 }
 
-/// Start a halter server forwarding to `upstream_base`, on ephemeral ports.
+/// Start a halter server with a single catch-all GitHub-flavored service pointing at
+/// `upstream_base` (the common case for most tests).
 pub async fn start_halter(upstream_base: &str) -> Harness {
+    start_halter_services(vec![Service {
+        name: "github".to_string(),
+        host: "*".to_string(),
+        upstream_base: upstream_base.to_string(),
+        flavor: Flavor::Github,
+    }])
+    .await
+}
+
+/// Start a halter server with an explicit service allowlist, on ephemeral ports.
+pub async fn start_halter_services(services: Vec<Service>) -> Harness {
     let credentials = Arc::new(InMemoryCredentials::new());
     let audit = Arc::new(InMemoryAudit::new());
     let control = Arc::new(ControlPlane::new(credentials.clone(), audit.clone()));
-    let gateway = Gateway::new(
-        control.clone(),
-        Route {
-            target: Target::Github,
-            upstream_base: upstream_base.to_string(),
-        },
-    );
+    let gateway = Gateway::new(control.clone(), ServiceRouter::new(services));
     let state = Arc::new(ServerState::new(gateway));
 
     let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

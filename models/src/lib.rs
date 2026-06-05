@@ -36,16 +36,16 @@ pub fn empty_fields() -> serde_json::Value {
 
 impl action::Action {
     /// Ergonomic constructor with an empty `fields` object (the generated `new` requires
-    /// every field, including `fields`, positionally).
+    /// every field, including `fields`, positionally). `target` is the service name.
     pub fn of(
         agent: impl Into<String>,
-        target: action::Target,
+        target: impl Into<String>,
         verb: action::Verb,
         resource: action::Resource,
     ) -> Self {
         Self {
             agent: agent.into(),
-            target,
+            target: target.into(),
             verb,
             resource,
             fields: empty_fields(),
@@ -100,14 +100,14 @@ impl verdict::Verdict {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::action::{Action, Resource, Target, Verb};
+    use super::action::{Action, Resource, Verb};
     use super::verdict::{CredentialRef, DenyReason, Verdict};
 
     #[test]
     fn action_round_trips_through_json() {
         let action = Action::of(
             "agent-1",
-            Target::Github,
+            "github",
             Verb::Create,
             Resource::of("repos/octocat/hello/pulls", "pull_request"),
         )

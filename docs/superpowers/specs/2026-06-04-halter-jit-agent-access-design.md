@@ -90,6 +90,27 @@ unchanged.
 - Real GitHub App installation-token minting/rotation in the vault (v1 takes a
   provisioned token).
 
+## Addendum (2026-06-05): any HTTPS service, any HTTP transport
+
+Generalized beyond the GitHub-only v1, without changing the core model:
+
+- **Any HTTPS service.** `Action.target` is now a generic **service name** (the `Github`
+  enum is gone). halter holds a **configured service allowlist**, each entry
+  `{ name, host, upstream_base, flavor }`, and routes a request to a service by its
+  `Host` header. An unmatched host is **denied (fail closed)** — halter only forwards to
+  its allowlist. Policy rules scope by service via `targets`.
+- **Flavors.** Normalization is **generic** by default (path-based; works for any
+  HTTP/JSON/SSE API); a service may opt into a richer flavor (`github`) for nicer
+  resource kinds. Adding a flavor never changes the engine — only the adapter.
+- **Any HTTP transport.** The forwarder **streams** the response body instead of
+  buffering it, so Server-Sent Events, chunked responses, and long-polls pass through
+  transparently. The request body is still buffered (policy conditions may inspect it).
+  WebSocket/`Upgrade` is the remaining transport not yet handled.
+
+This kept the `Action`/`Verdict` contract and the pure engine unchanged — only the
+`gateway` (new `service` router, flavored `normalize`, streaming `forward`) and config
+(a `services` list replacing the single `route`) moved.
+
 ## Verification
 
 - Unit tests: engine (matching, globs, conditions, first-match/default-deny), control

@@ -55,7 +55,7 @@ impl AuditSink for TracingAudit {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use models::action::{Action, Resource, Target, Verb};
+    use models::action::{Action, Resource, Verb};
     use models::audit::Decision;
 
     #[test]
@@ -65,12 +65,7 @@ mod tests {
             sink.record(AuditEvent {
                 at_ms: i as u64,
                 agent: "a".into(),
-                action: Action::of(
-                    "a",
-                    Target::Github,
-                    Verb::Read,
-                    Resource::of("repos/o/r", "repo"),
-                ),
+                action: Action::of("a", "github", Verb::Read, Resource::of("repos/o/r", "repo")),
                 decision,
                 detail: String::new(),
             });

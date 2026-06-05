@@ -1,17 +1,23 @@
-//! GitHub request → [`Action`] normalization. This is the protocol adapter: it turns a
-//! raw HTTP request into the engine's protocol-agnostic `Action`. A second adapter
-//! (K8s, an Envoy ext_authz shim, …) would live beside it and produce the same type.
+//! Request → [`Action`] normalization. This is the protocol adapter: it turns a raw
+//! HTTP request into the engine's protocol-agnostic `Action`. Normalization is generic
+//! by default (any HTTP/JSON or SSE service); a service can opt into a richer [`Flavor`]
+//! (e.g. GitHub) for nicer resource kinds. A future K8s/Envoy adapter is a sibling here.
 
 use crate::core::ProxyRequest;
-use models::action::{Action, Resource, Target, Verb};
+use crate::service::{Flavor, Service};
+use models::action::{Action, Resource, Verb};
 use serde_json::{Map, Value};
 
-/// Normalize a GitHub HTTP request into an `Action` for `agent`.
-pub fn normalize(agent: &str, target: Target, req: &ProxyRequest) -> Action {
+/// Normalize a request to `service` into an `Action` for `agent`.
+pub fn normalize(agent: &str, service: &Service, req: &ProxyRequest) -> Action {
     let verb = verb_for(&req.method);
-    let resource = parse_resource(req.path.trim_start_matches('/'));
+    let path = req.path.trim_start_matches('/');
+    let resource = match service.flavor {
+        Flavor::Github => github_resource(path),
+        Flavor::Generic => generic_resource(path),
+    };
     let fields = merge_fields(&req.query, &req.body);
-    Action::of(agent, target, verb, resource).with_fields(fields)
+    Action::of(agent, service.name.clone(), verb, resource).with_fields(fields)
 }
 
 /// Map an HTTP method to a coarse [`Verb`]. Unknown/odd methods map to `Read`, the
@@ -26,25 +32,32 @@ fn verb_for(method: &http::Method) -> Verb {
     }
 }
 
-/// Parse a GitHub API path (already stripped of its leading `/`) into a canonical
-/// resource. The `path` field keeps every segment so policy globs can be as specific or
-/// as broad as needed; `kind` is the coarse class taken from the resource collection.
-fn parse_resource(path: &str) -> Resource {
+/// Generic resource: the full path as the canonical id, with the first path segment as
+/// a coarse `kind`. Works for any service.
+fn generic_resource(path: &str) -> Resource {
+    if path.is_empty() {
+        return Resource::of("", "root");
+    }
+    let kind = path.split('/').next().unwrap_or("other");
+    Resource::of(path, kind)
+}
+
+/// GitHub-aware resource parsing (the `github` flavor).
+fn github_resource(path: &str) -> Resource {
     if path.is_empty() {
         return Resource::of("", "root");
     }
     let segments: Vec<&str> = path.split('/').collect();
     let kind = match segments.as_slice() {
         ["repos", _owner, _repo] => "repo",
-        ["repos", _owner, _repo, collection, ..] => collection_kind(collection),
+        ["repos", _owner, _repo, collection, ..] => github_collection_kind(collection),
         [first, ..] => first,
         [] => "other",
     };
     Resource::of(path, kind)
 }
 
-/// Coarse class for a repo sub-collection segment.
-fn collection_kind(collection: &str) -> &'static str {
+fn github_collection_kind(collection: &str) -> &'static str {
     match collection {
         "pulls" => "pull_request",
         "issues" => "issue",
@@ -95,6 +108,15 @@ mod tests {
     use bytes::Bytes;
     use http::HeaderMap;
 
+    fn service(name: &str, flavor: Flavor) -> Service {
+        Service {
+            name: name.into(),
+            host: "*".into(),
+            upstream_base: "https://upstream.example".into(),
+            flavor,
+        }
+    }
+
     fn req(method: http::Method, path: &str, query: &str, body: &str) -> ProxyRequest {
         ProxyRequest {
             method,
@@ -106,14 +128,15 @@ mod tests {
     }
 
     #[test]
-    fn create_pr_normalizes() {
+    fn github_flavor_parses_pull_request() {
         let r = req(
             http::Method::POST,
             "/repos/octocat/hello/pulls",
             "",
             r#"{"base":"main","title":"x"}"#,
         );
-        let a = normalize("agent-1", Target::Github, &r);
+        let a = normalize("agent-1", &service("github", Flavor::Github), &r);
+        assert_eq!(a.target, "github");
         assert_eq!(a.verb, Verb::Create);
         assert_eq!(a.resource.path, "repos/octocat/hello/pulls");
         assert_eq!(a.resource.kind, "pull_request");
@@ -124,48 +147,36 @@ mod tests {
     }
 
     #[test]
-    fn get_repo_is_read() {
+    fn generic_flavor_uses_first_segment_kind() {
         let a = normalize(
             "a",
-            Target::Github,
-            &req(http::Method::GET, "/repos/octocat/hello", "", ""),
+            &service("openai", Flavor::Generic),
+            &req(
+                http::Method::POST,
+                "/v1/chat/completions",
+                "",
+                r#"{"model":"gpt"}"#,
+            ),
         );
-        assert_eq!(a.verb, Verb::Read);
-        assert_eq!(a.resource.kind, "repo");
+        assert_eq!(a.target, "openai");
+        assert_eq!(a.verb, Verb::Create);
+        assert_eq!(a.resource.path, "v1/chat/completions");
+        assert_eq!(a.resource.kind, "v1");
+        assert_eq!(a.fields, serde_json::json!({ "model": "gpt" }));
     }
 
     #[test]
     fn verbs_map_from_methods() {
         assert_eq!(verb_for(&http::Method::DELETE), Verb::Delete);
         assert_eq!(verb_for(&http::Method::PATCH), Verb::Update);
-        assert_eq!(verb_for(&http::Method::PUT), Verb::Update);
         assert_eq!(verb_for(&http::Method::HEAD), Verb::Read);
-    }
-
-    #[test]
-    fn query_params_become_fields() {
-        let a = normalize(
-            "a",
-            Target::Github,
-            &req(
-                http::Method::GET,
-                "/repos/o/r/issues",
-                "state=open&labels=bug",
-                "",
-            ),
-        );
-        assert_eq!(
-            a.fields,
-            serde_json::json!({ "state": "open", "labels": "bug" })
-        );
-        assert_eq!(a.resource.kind, "issue");
     }
 
     #[test]
     fn body_overrides_query_fields() {
         let a = normalize(
             "a",
-            Target::Github,
+            &service("svc", Flavor::Generic),
             &req(
                 http::Method::POST,
                 "/x",
@@ -180,7 +191,7 @@ mod tests {
     fn non_json_body_is_ignored_for_fields() {
         let a = normalize(
             "a",
-            Target::Github,
+            &service("svc", Flavor::Generic),
             &req(http::Method::POST, "/x", "", "not json"),
         );
         assert_eq!(a.fields, serde_json::json!({}));

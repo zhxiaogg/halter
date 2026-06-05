@@ -8,9 +8,10 @@
 //! executes the forward. Keeping this layer free of HTTP plumbing makes the whole
 //! decision path deterministically testable.
 
-use crate::github;
+use crate::normalize;
+use crate::service::{Service, ServiceRouter};
 use control::{ControlPlane, now_ms};
-use models::action::{Action, Target};
+use models::action::Action;
 use models::audit::{AuditEvent, Decision};
 use models::verdict::{DenyReason, Obligation, Verdict};
 use std::sync::Arc;
@@ -49,40 +50,33 @@ pub struct Rejection {
     pub message: String,
 }
 
-/// Where a target's traffic is forwarded.
-#[derive(Clone)]
-pub struct Route {
-    pub target: Target,
-    /// Upstream base URL without a trailing slash, e.g. `https://api.github.com`.
-    pub upstream_base: String,
-}
-
 /// A source of wall-clock time, injectable for tests.
 type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-/// The data-plane decision engine. Holds the control plane and the (single, in v1)
-/// upstream route.
+/// The data-plane decision engine. Holds the control plane and the service routing
+/// table (any number of configured upstream HTTPS services).
 pub struct Gateway {
     control: Arc<ControlPlane>,
-    route: Route,
+    router: ServiceRouter,
     clock: Clock,
 }
 
 impl Gateway {
-    /// Build a gateway over `control` forwarding to `route`, using the wall clock.
-    pub fn new(control: Arc<ControlPlane>, route: Route) -> Self {
+    /// Build a gateway over `control` routing to `router`'s services, using the wall
+    /// clock.
+    pub fn new(control: Arc<ControlPlane>, router: ServiceRouter) -> Self {
         Self {
             control,
-            route,
+            router,
             clock: Arc::new(now_ms),
         }
     }
 
     /// Build a gateway with an injected clock (tests).
-    pub fn with_clock(control: Arc<ControlPlane>, route: Route, clock: Clock) -> Self {
+    pub fn with_clock(control: Arc<ControlPlane>, router: ServiceRouter, clock: Clock) -> Self {
         Self {
             control,
-            route,
+            router,
             clock,
         }
     }
@@ -112,8 +106,22 @@ impl Gateway {
                 "unknown or expired halter token",
             );
         };
+
+        // Route to a configured service by the request Host. An unmatched host is denied
+        // (fail closed) — halter only forwards to its allowlist.
+        let host = extract_host(&req.headers).unwrap_or_default();
+        let Some(service) = self.router.route(&host).cloned() else {
+            self.audit_raw(&agent, &host, Decision::Deny, "no service for host", now);
+            return reject(
+                http::StatusCode::NOT_FOUND,
+                DenyReason::UnknownTarget,
+                "no service configured for this host",
+            );
+        };
+
+        let action = normalize::normalize(&agent, &service, &req);
+
         let Some(policy) = self.control.registry.policy(&agent) else {
-            let action = github::normalize(&agent, self.route.target.clone(), &req);
             self.audit(&action, Decision::Deny, "no policy registered", now);
             return reject(
                 http::StatusCode::FORBIDDEN,
@@ -122,13 +130,12 @@ impl Gateway {
             );
         };
 
-        let action = github::normalize(&agent, self.route.target.clone(), &req);
         match policy::decide(&action, &policy) {
             Verdict::Deny(d) => {
                 self.audit(&action, Decision::Deny, &format!("{:?}", d.reason), now);
                 reject(http::StatusCode::FORBIDDEN, d.reason, "denied by policy")
             }
-            Verdict::Allow(a) => self.plan_forward(&action, &a.obligations, req, now),
+            Verdict::Allow(a) => self.plan_forward(&service, &action, &a.obligations, req, now),
         }
     }
 
@@ -137,6 +144,7 @@ impl Gateway {
     /// the substitution that hides the real secret).
     fn plan_forward(
         &self,
+        service: &Service,
         action: &Action,
         obligations: &[Obligation],
         req: ProxyRequest,
@@ -188,21 +196,11 @@ impl Gateway {
         self.audit(action, Decision::Allow, &detail, now);
 
         Outcome::Forward(ForwardPlan {
-            url: self.upstream_url(&req.path, &req.query),
+            url: upstream_url(&service.upstream_base, &req.path, &req.query),
             method: req.method,
             headers,
             body: req.body,
         })
-    }
-
-    /// Join the upstream base with the request path and optional query.
-    fn upstream_url(&self, path: &str, query: &str) -> String {
-        let base = self.route.upstream_base.trim_end_matches('/');
-        if query.is_empty() {
-            format!("{base}{path}")
-        } else {
-            format!("{base}{path}?{query}")
-        }
     }
 
     fn audit(&self, action: &Action, decision: Decision, detail: &str, now: u64) {
@@ -214,6 +212,36 @@ impl Gateway {
             detail: detail.to_string(),
         });
     }
+
+    /// Audit a decision made before an `Action` exists (e.g. an unroutable host). The
+    /// recorded action carries the raw host so the event is still attributable.
+    fn audit_raw(&self, agent: &str, host: &str, decision: Decision, detail: &str, now: u64) {
+        let action = Action::of(
+            agent,
+            "<unrouted>",
+            models::action::Verb::Read,
+            models::action::Resource::of(host, "host"),
+        );
+        self.audit(&action, decision, detail, now);
+    }
+}
+
+/// Join an upstream base with the request path and optional query.
+fn upstream_url(base: &str, path: &str, query: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if query.is_empty() {
+        format!("{base}{path}")
+    } else {
+        format!("{base}{path}?{query}")
+    }
+}
+
+/// Extract the `Host` header value.
+fn extract_host(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 fn reject(status: http::StatusCode, reason: DenyReason, message: &str) -> Outcome {
@@ -270,6 +298,7 @@ fn is_dropped_header(name: &http::HeaderName) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::service::{Flavor, Service, ServiceRouter};
     use control::{InMemoryAudit, Secret};
     use models::policy::{Effect, Match, Policy, Rule};
 
@@ -287,11 +316,14 @@ mod tests {
         (Arc::new(plane), audit, creds)
     }
 
-    fn route() -> Route {
-        Route {
-            target: Target::Github,
+    /// A catch-all GitHub-flavored service pointing at the real API base.
+    fn router() -> ServiceRouter {
+        ServiceRouter::new(vec![Service {
+            name: "github".into(),
+            host: "*".into(),
             upstream_base: "https://api.github.com".into(),
-        }
+            flavor: Flavor::Github,
+        }])
     }
 
     fn allow_all_with_cred() -> Policy {
@@ -335,7 +367,7 @@ mod tests {
     #[test]
     fn missing_token_is_unauthorized() {
         let (control, _audit, _) = test_control();
-        let gw = Gateway::new(control, route());
+        let gw = Gateway::new(control, router());
         match gw.handle(get(http::HeaderMap::new(), "/repos/o/r")) {
             Outcome::Reject(r) => {
                 assert_eq!(r.status, http::StatusCode::UNAUTHORIZED);
@@ -348,7 +380,7 @@ mod tests {
     #[test]
     fn unknown_token_is_unauthorized() {
         let (control, _a, _) = test_control();
-        let gw = Gateway::new(control, route());
+        let gw = Gateway::new(control, router());
         match gw.handle(get(bearer("not-a-real-token"), "/repos/o/r")) {
             Outcome::Reject(r) => assert_eq!(r.reason, DenyReason::Unauthenticated),
             Outcome::Forward(_) => panic!("expected reject"),
@@ -359,7 +391,7 @@ mod tests {
     fn allowed_request_injects_credential_and_strips_agent_token() {
         let (control, audit, _) = test_control();
         control.registry.register("agent-1", allow_all_with_cred());
-        let gw = Gateway::with_clock(control.clone(), route(), fixed_clock(1_000));
+        let gw = Gateway::with_clock(control.clone(), router(), fixed_clock(1_000));
         let minted = gw.mint("agent-1", 60).unwrap();
 
         match gw.handle(get(bearer(&minted.token), "/repos/octocat/hello")) {
@@ -387,10 +419,10 @@ mod tests {
         let (control, _a, _) = test_control();
         control.registry.register("agent-1", allow_all_with_cred());
         // Mint at t=1000 with 60s TTL → expires at 61_000.
-        let gw_mint = Gateway::with_clock(control.clone(), route(), fixed_clock(1_000));
+        let gw_mint = Gateway::with_clock(control.clone(), router(), fixed_clock(1_000));
         let minted = gw_mint.mint("agent-1", 60).unwrap();
         // Handle at t=61_000 (expired).
-        let gw = Gateway::with_clock(control, route(), fixed_clock(61_000));
+        let gw = Gateway::with_clock(control, router(), fixed_clock(61_000));
         match gw.handle(get(bearer(&minted.token), "/repos/o/r")) {
             Outcome::Reject(r) => assert_eq!(r.reason, DenyReason::Unauthenticated),
             Outcome::Forward(_) => panic!("expected reject"),
@@ -416,7 +448,7 @@ mod tests {
                 }],
             },
         );
-        let gw = Gateway::with_clock(control, route(), fixed_clock(1_000));
+        let gw = Gateway::with_clock(control, router(), fixed_clock(1_000));
         let minted = gw.mint("agent-1", 60).unwrap();
         let del = ProxyRequest {
             method: http::Method::DELETE,
@@ -443,7 +475,7 @@ mod tests {
         // control without the agent. Simpler: mint manually against tokens table.
         let now = 1_000;
         let minted = control.tokens.mint("ghost", 60, now);
-        let gw = Gateway::with_clock(control, route(), fixed_clock(now));
+        let gw = Gateway::with_clock(control, router(), fixed_clock(now));
         match gw.handle(get(bearer(&minted.token), "/repos/o/r")) {
             Outcome::Reject(r) => assert_eq!(r.reason, DenyReason::NoPolicy),
             Outcome::Forward(_) => panic!("expected reject"),
@@ -453,7 +485,7 @@ mod tests {
     #[test]
     fn mint_unknown_agent_returns_none() {
         let (control, _a, _) = test_control();
-        let gw = Gateway::new(control, route());
+        let gw = Gateway::new(control, router());
         assert!(gw.mint("nobody", 60).is_none());
     }
 

@@ -3,11 +3,16 @@
 **JIT, policy-scoped access for untrusted AI agents.**
 
 An agent runs in a sandbox whose only network egress is the halter proxy. It is given a
-short-lived **halter token** — never a real credential. When it calls GitHub (via `gh`,
-`git`, or raw API), halter normalizes the request, evaluates the agent's standing
-policy, and — only if allowed — swaps the halter token for the **real** upstream
-credential and forwards it. The agent never sees a secret, can't exceed its policy, and
-every decision is audited.
+short-lived **halter token** — never a real credential. When it calls a configured
+service — GitHub, OpenAI, any HTTPS API (via `gh`, `git`, an SDK, or raw HTTP) — halter
+routes by Host, normalizes the request, evaluates the agent's standing policy, and —
+only if allowed — swaps the halter token for the **real** upstream credential and
+forwards it. The agent never sees a secret, can't exceed its policy, and every decision
+is audited.
+
+**Any HTTPS service, any HTTP transport.** Upstreams are a configured allowlist routed
+by `Host` (unknown host → denied, fail closed). Responses are **streamed**, so plain
+request/response, Server-Sent Events, and long-polls all flow through transparently.
 
 This is the companion to [horsie](../horsie): horsie sandboxes the agent runtime (via
 [nono](https://github.com/always-further/nono): Landlock/Seatbelt) and points its egress
@@ -31,11 +36,13 @@ Three planes, with the policy engine deliberately decoupled from the data plane 
 can be reused by any proxy (an Envoy `ext_authz` adapter, a hudsucker MITM, …) later.
 
 ```
- sandboxed agent ──(only egress)──▶ halter reverse proxy ──▶ GitHub
-   gh / git / curl                   │  normalize → Action
-   Authorization: <halter token>     │  policy::decide(Action) → Verdict
-                                      │  inject real credential, strip halter token
-                                      ▼
+ sandboxed agent ──(only egress)──▶ halter reverse proxy ──▶ any configured HTTPS service
+   gh / git / sdk / curl             │  route by Host → service        (GitHub, OpenAI, …)
+   Authorization: <halter token>     │  normalize → Action
+                                     │  policy::decide(Action) → Verdict
+                                     │  inject real credential, strip halter token
+                                     │  stream response (HTTP / SSE)
+                                     ▼
                           audit every decision
 ```
 
@@ -44,7 +51,7 @@ can be reused by any proxy (an Envoy `ext_authz` adapter, a hudsucker MITM, …)
 | `models` | fluorite-generated contract types: `Action`, `Verdict`, `Policy`, audit + mint wire types |
 | `policy` | the **reusable engine** — pure `decide(&Action, &Policy) -> Verdict`, no I/O |
 | `control` | control plane: agent→policy registry, token minting, credential vault, audit sink |
-| `gateway` | data plane: GitHub→`Action` normalizer, decision/enforcement core, axum reverse proxy |
+| `gateway` | data plane: Host router + service allowlist, request→`Action` normalizer (generic + flavors), decision/enforcement core, streaming reverse proxy |
 | `cli` | the `halter` binary: `serve` + `mint` |
 | `tests` | full-stack e2e tests (mock GitHub upstream + live server) |
 

@@ -10,7 +10,7 @@ mod config;
 use clap::{Parser, Subcommand};
 use config::Config;
 use control::{ControlPlane, InMemoryCredentials, Secret, TracingAudit};
-use gateway::{Gateway, Route};
+use gateway::{Flavor, Gateway, Service, ServiceRouter};
 use models::control::{MintRequest, MintResponse};
 use std::sync::Arc;
 
@@ -81,17 +81,24 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             .registry
             .register(agent.id.clone(), agent.policy.clone());
     }
+    let services: Vec<Service> = cfg
+        .services
+        .iter()
+        .map(|s| Service {
+            name: s.name.clone(),
+            host: s.host.clone(),
+            upstream_base: s.upstream_base.clone(),
+            flavor: Flavor::parse(s.flavor.as_deref()),
+        })
+        .collect();
     tracing::info!(
         agents = cfg.agents.len(),
         credentials = cfg.credentials.len(),
+        services = services.len(),
         "loaded config"
     );
 
-    let route = Route {
-        target: cfg.route.target.clone(),
-        upstream_base: cfg.route.upstream_base.clone(),
-    };
-    let gateway = Gateway::new(control, route);
+    let gateway = Gateway::new(control, ServiceRouter::new(services));
 
     let proxy_addr = cfg.proxy_addr.parse()?;
     let admin_addr = cfg.admin_addr.parse()?;

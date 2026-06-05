@@ -3,7 +3,6 @@
 /// evaluated top-to-bottom by the `policy` engine with first-match-wins, default-deny.
 package policy;
 
-use action.Target;
 use action.Verb;
 
 /// Whether a matching rule grants or denies the action.
@@ -32,8 +31,8 @@ union Condition {
 
 /// What an action must look like for a rule to apply. Each empty list means "any".
 struct Match {
-    /// Targets this rule applies to; empty = any target.
-    targets: Vec<Target>,
+    /// Service names this rule applies to (e.g. "github"); empty = any service.
+    targets: Vec<String>,
     /// Verbs this rule applies to; empty = any verb.
     verbs: Vec<Verb>,
     /// Resource-path globs (segment-wise `*`, trailing `**` matches any remainder),

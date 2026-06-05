@@ -4,11 +4,6 @@
 /// This is the portability boundary that lets the engine outlive any single proxy.
 package action;
 
-/// Which external system the action targets. Extended as new adapters land.
-enum Target {
-    Github,
-}
-
 /// The operation kind, abstracted over a protocol's concrete verbs (HTTP method, etc.).
 enum Verb {
     Read,
@@ -30,7 +25,9 @@ struct Resource {
 struct Action {
     /// The agent on whose behalf the request is made (resolved from the halter token).
     agent: String,
-    target: Target,
+    /// The configured service this targets (e.g. "github", "openai") — the routing key
+    /// halter matched, and what policy rules scope to.
+    target: String,
     verb: Verb,
     resource: Resource,
     /// Selected request attributes (merged query + JSON body) for conditional rules,

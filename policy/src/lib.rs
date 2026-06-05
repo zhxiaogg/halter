@@ -10,7 +10,7 @@
 //! matches the action is **denied** (fail closed). An `Allow` rule's
 //! `grant_credentials` become credential-injection obligations the data plane fulfills.
 
-use models::action::{Action, Target, Verb};
+use models::action::{Action, Verb};
 use models::policy::{Condition, Effect, Match, Policy, Rule};
 use models::verdict::{CredentialRef, DenyReason, Verdict};
 use serde_json::Value;
@@ -53,8 +53,8 @@ fn rule_matches(rule: &Rule, action: &Action) -> bool {
             .all(|c| condition_holds(c, &action.fields))
 }
 
-fn target_matches(targets: &[Target], target: &Target) -> bool {
-    targets.is_empty() || targets.contains(target)
+fn target_matches(targets: &[String], target: &str) -> bool {
+    targets.is_empty() || targets.iter().any(|t| t == target)
 }
 
 fn verb_matches(verbs: &[Verb], verb: &Verb) -> bool {
@@ -111,7 +111,7 @@ fn lookup<'a>(fields: &'a Value, path: &str) -> Option<&'a Value> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use models::action::{Action, Resource, Target, Verb};
+    use models::action::{Action, Resource, Verb};
     use models::policy::{
         Condition, Effect, EqualsCondition, ExistsCondition, Match, OneOfCondition, Policy, Rule,
     };
@@ -145,7 +145,7 @@ mod tests {
     fn pr_create() -> Action {
         Action::of(
             "agent-1",
-            Target::Github,
+            "github",
             Verb::Create,
             Resource::of("repos/octocat/hello/pulls", "pull_request"),
         )
@@ -213,7 +213,7 @@ mod tests {
         };
         let read = Action::of(
             "agent-1",
-            Target::Github,
+            "github",
             Verb::Read,
             Resource::of("repos/octocat/hello", "repo"),
         );
