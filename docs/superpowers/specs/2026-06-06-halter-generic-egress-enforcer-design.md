@@ -30,19 +30,22 @@ Three roles (v1 conflated the first two):
 - **Minter** — submits a **policy document + TTL** to the admin API; receives an **opaque
   token** (or, for SigV4 upstreams, a minted **dummy credential**). Sees service/target
   *names* and the action vocabulary — **never a real secret**.
-- **Consumer** — holds only the token + the halter endpoint; drops it into `gh`/`kubectl`/
-  `aws`/an SDK. **Never sees a real credential.** In injection mode it never sees the upstream
-  secret; in filter-only mode it carries its *own* credential, which halter passes through.
+- **Consumer** — holds only the token + the halter endpoint; runs stock `gh`/`kubectl`/
+  `aws`/an SDK after a one-shot `halter-agent setup --token` (see *Agent setup*). **Never sees
+  a real credential.** In injection mode it never sees the upstream secret; in filter-only mode
+  it carries its *own* credential, which halter passes through.
 
 **TLS / what halter sees.** Content-aware policy (verb, path, body conditions) requires
-plaintext, which requires halter to **terminate TLS** on the consumer→halter leg. The
-consumer points its client at halter (`GH_HOST`, kubeconfig `server`, `AWS_ENDPOINT_URL`) and
-trusts halter's own cert via explicit per-sandbox config (`AWS_CA_BUNDLE`, kubeconfig
-`certificate-authority-data`, or plain HTTP on localhost). This is **not** MITM and **not**
-system-CA distribution — halter presents its own identity; the client is knowingly pointed at
-it. Consequence: halter sees the consumer's `Authorization` header in plaintext even in
-filter-only mode. "Filter on the body" and "see the credential" are the same property; what a
-rule controls is only whether halter *swaps* the credential or passes it through.
+plaintext, which requires halter to **terminate TLS** on the consumer→halter leg. The default
+is **endpoint-override**: each tool is pointed at halter (`GH_HOST`, kubeconfig `server`,
+`AWS_ENDPOINT_URL`) and trusts **halter's own serving cert** (one host to trust) — written by
+the `halter-agent` CLI, not by hand. This is **not** MITM and **not** system-CA distribution —
+halter presents its own identity; the client is knowingly pointed at it. (A **transparent-MITM**
+mode — a sandbox-scoped forging CA + L4 redirect, agent unconfigured — is the fallback for
+cert-pinning clients that can't override their endpoint.) Consequence: halter sees the
+consumer's `Authorization` header in plaintext even in filter-only mode. "Filter on the body"
+and "see the credential" are the same property; what a rule controls is only whether halter
+*swaps* the credential or passes it through.
 
 The only alternative — filtering without decrypting — degrades to a host/SNI allowlist (no
 verb/path/body policy), which the sandbox layer already does. So termination is required for
@@ -221,6 +224,68 @@ In the single-trust-domain local setup, the mint endpoint is localhost-bound and
 minter, so "valid policy → token" is safe. Caller-authorization becomes necessary only with
 multiple trust domains (see Deferred).
 
+## Agent setup / provisioning (consumer side)
+
+Per-tool wiring is **automated by a consumer CLI**, not hand-configured — that is what keeps
+the endpoint-override model from being intrusive. The agent runs one command and then uses
+stock tools unaware of halter.
+
+**Provision doc — the artifact the CLI acts on.** The policy alone can't configure the tools
+(it says *what's allowed*, not *how to reach each target or with what credential material*).
+The control plane projects the policy into a **provision doc** =
+`policy targets ⋈ service-registry connection info ⋈ minted credential material`, served from a
+token-authenticated `GET /provision`:
+
+```jsonc
+ProvisionDoc {                          // fluorite protocol type
+  halter_ca: "<pem>",                   // halter's own serving cert — one host to trust
+  expires_at_ms: …,
+  services: [
+    { target: "github",     type: "github", address: "https://halter.local:9090",
+      auth: { scheme: "bearer", token: "<halter-token>" } },
+    { target: "eks-prod",   type: "k8s",    address: "https://prod.k8s.halter.local",
+      auth: { scheme: "bearer", token: "<halter-token>" } },
+    { target: "aws-acct-A", type: "aws",    address: "https://halter.local:9090",
+      auth: { scheme: "sigv4", access_key_id: "AKIA_DUMMY…",
+              secret_access_key: "…", region: "us-east-1" } }
+  ]
+}
+```
+
+It contains **no real secrets** — only the bearer token the holder already has, *dummy* AWS
+creds (worthless against real AWS), and halter's endpoints/CA. So returning it to the token
+holder is safe and recommended for transparency. The **consumer-facing `address`** per target
+comes from a registry field distinct from `upstream_base` (how the *consumer* reaches the
+target through halter vs. how halter reaches the real upstream).
+
+**The `halter-agent` CLI** (new consumer binary):
+
+```
+halter-agent setup    --token <t> [--ca halter-ca.pem]   # fetch doc, configure every service
+halter-agent env      --token <t>                        # export lines for `eval` (SDK/base-url tools)
+halter-agent status   --token <t>                        # configured state + reachability + expiry
+halter-agent policy   --token <t>                        # human-readable allowed actions (transparency)
+halter-agent teardown                                    # remove what setup added
+```
+
+`setup` walks `services[]` and writes each tool's **native** config, **idempotent and
+merge-not-clobber**:
+- **github** → git `http.sslCAInfo`, `url.…insteadOf https://github.com/`, a credential helper
+  returning the bearer token; `GH_HOST`/`GH_TOKEN` for `gh`.
+- **k8s** → merge a namespaced context per cluster into kubeconfig (`server`, CA, `user.token`).
+- **aws** → a `~/.aws/credentials` profile per account (dummy cred) + `~/.aws/config`
+  (`endpoint_url`, `region`, `ca_bundle`).
+- **generic** → `halter-agent env` emits base-url + CA-bundle vars.
+
+**Trust bootstrap (one chicken-and-egg).** `setup` fetches the doc over TLS but must trust
+halter's cert *before* the doc delivers the CA. Resolve by delivering `(token, CA)` together at
+launch (`--ca`, image pre-placement, or first-contact pinning over localhost). The orchestrator
+handing both is the clean path.
+
+**Lifecycle.** Namespacing what `setup` writes (a dedicated kubeconfig context, a named aws
+profile, scoped git config) makes re-running on token rotation update in place and `teardown`
+remove exactly what was added.
+
 ## Out of scope / deferred
 
 - **Multi-tenant mint authorization.** When one halter serves multiple trust domains, add:
@@ -241,13 +306,13 @@ multiple trust domains (see Deferred).
   Bearer-in (halter token) → route by Host → REST normalize: `verb=Create`,
   `resource="repos/o/r/pulls"`, `fields={base:"main"}` → rule `allow Create on repos/*/*/pulls
   if base==develop` → `main≠develop` → **deny**. Allowed PRs inject the GitHub-App token.
-- **k8s — read pods in `dev`.** kubeconfig `server`→halter, static `token`=halter token, CA=
-  halter cert. `kubectl get pods -n dev` → Bearer-in → route by per-cluster host → REST
-  normalize `verb=Read, resource=api/v1/namespaces/dev/pods` → allow → inject EKS `get-token`
-  → forward. Consumer never saw AWS creds or the EKS token.
-- **aws s3 — write to one bucket (Tier 0).** `AWS_ENDPOINT_URL`→halter, dummy cred,
-  `AWS_CA_BUNDLE`=halter cert. `aws s3 cp f s3://my-data/…` → SigV4-verify dummy → route by
-  AKID → REST normalize `verb=Update, resource=my-data/…` → rule `allow PUT my-data/**` →
+- **k8s — read pods in `dev`.** `halter-agent setup` merged the cluster context (`server`→
+  halter, static `token`, CA). `kubectl get pods -n dev` → Bearer-in → route by per-cluster
+  host → REST normalize `verb=Read, resource=api/v1/namespaces/dev/pods` → allow → inject EKS
+  `get-token` → forward. Consumer never saw AWS creds or the EKS token.
+- **aws s3 — write to one bucket (Tier 0).** `halter-agent setup` wrote the aws profile (dummy
+  cred, `endpoint_url`, `ca_bundle`). `aws s3 cp f s3://my-data/…` → SigV4-verify dummy → route
+  by AKID → REST normalize `verb=Update, resource=my-data/…` → rule `allow PUT my-data/**` →
   re-sign with real account A → forward. No field extraction needed.
 - **aws ec2 — read but not destroy (Tier 1).** Both ops are `POST /`; the action is in the
   form body. `aws-query` parser extracts `action=DescribeInstances|TerminateInstances` →
@@ -259,11 +324,13 @@ multiple trust domains (see Deferred).
 - **Unit:** engine (unchanged); auth-mechanism library (bearer extract, SigV4 verify/sign);
   the RESTful extractor and each RPC parser (canonicalization + fail-closed on ambiguity);
   catalog resolution per strategy; mint-time validation (semantic reject vs structural pass);
-  routing (address vs inbound-identity).
+  routing (address vs inbound-identity); provision-doc projection (no real secrets leak) and
+  `halter-agent setup` config writing (idempotent merge + teardown).
 - **e2e:** live server + mock upstreams proving — REST allow/deny with credential
   passthrough *and* injection; SigV4 re-sign (dummy verified, real signature upstream,
   consumer secret absent); k8s discovery-backed catalog validation; AWS Tier-1 action
-  extraction gating destroy; unknown-target/unknown-action mint rejection; every decision
-  audited with the concrete target.
+  extraction gating destroy; unknown-target/unknown-action mint rejection; `/provision` returns
+  a usable doc that configures a stock tool end-to-end; every decision audited with the
+  concrete target.
 - **Gate:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test --workspace`.
