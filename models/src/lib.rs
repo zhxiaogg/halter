@@ -28,6 +28,11 @@ pub mod control {
     include!(concat!(env!("OUT_DIR"), "/control/mod.rs"));
 }
 
+#[allow(clippy::doc_markdown, clippy::too_many_arguments)]
+pub mod provision {
+    include!(concat!(env!("OUT_DIR"), "/provision/mod.rs"));
+}
+
 /// An empty `fields` JSON object — the default when a request carries no query or body
 /// attributes relevant to conditional rules.
 pub fn empty_fields() -> serde_json::Value {

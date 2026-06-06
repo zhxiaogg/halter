@@ -49,12 +49,18 @@ impl Tokens {
 
     /// Resolve a token to its bound policy, or `None` if unknown or expired at `now_ms`.
     pub fn resolve(&self, token: &str, now_ms: u64) -> Option<Policy> {
+        self.resolve_full(token, now_ms).map(|(policy, _)| policy)
+    }
+
+    /// Resolve a token to its bound policy and absolute expiry, or `None` if unknown or
+    /// expired at `now_ms`. Used by the provision projection.
+    pub fn resolve_full(&self, token: &str, now_ms: u64) -> Option<(Policy, u64)> {
         let entries = self.entries.read();
         let entry = entries.get(token)?;
         if entry.expires_at_ms <= now_ms {
             return None;
         }
-        Some(entry.policy.clone())
+        Some((entry.policy.clone(), entry.expires_at_ms))
     }
 
     /// Revoke a token immediately. Returns whether a token was removed.

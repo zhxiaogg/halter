@@ -148,6 +148,42 @@ async fn missing_or_invalid_token_is_unauthorized() {
     assert!(!upstream.was_called());
 }
 
+/// User story: a consumer fetches its setup bundle from `/provision` with its token.
+#[tokio::test]
+async fn provision_returns_setup_bundle() {
+    let upstream = start_mock_upstream().await;
+    let halter = start_halter(&upstream.base_url).await;
+    halter.add_credential("github-app", "real-secret-token");
+    let token = halter.mint_token(&policy_from(READ_ONLY), 3600).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/provision", halter.admin_url))
+        .header("X-Halter-Token", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let doc: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(doc["halterToken"], token);
+    // The github service (allow-all-targets policy) is surfaced, in inject mode, and no
+    // real secret leaks into the doc.
+    let services = doc["services"].as_array().unwrap();
+    assert!(services.iter().any(|s| s["target"] == "github"));
+    assert!(!resp_text_contains(&doc, "real-secret-token"));
+
+    // No token → 401.
+    let unauth = reqwest::Client::new()
+        .get(format!("{}/provision", halter.admin_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), 401);
+}
+
+fn resp_text_contains(doc: &serde_json::Value, needle: &str) -> bool {
+    doc.to_string().contains(needle)
+}
+
 /// User story: any structurally valid policy mints a token (no agent identity).
 #[tokio::test]
 async fn admin_mint_accepts_any_valid_policy() {

@@ -136,6 +136,7 @@ pub async fn start_halter(upstream_base: &str) -> Harness {
         outbound: Outbound::Bearer {
             credential: "github-app".to_string(),
         },
+        address: String::new(),
     }])
     .await
 }

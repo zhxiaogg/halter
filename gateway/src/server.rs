@@ -12,7 +12,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Json, State};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use http::StatusCode;
 use models::control::MintRequest;
 use std::sync::Arc;
@@ -46,6 +46,7 @@ pub fn proxy_router(state: Arc<ServerState>) -> Router {
 pub fn admin_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/mint", post(mint_handler))
+        .route("/provision", get(provision_handler))
         .with_state(state)
 }
 
@@ -97,6 +98,21 @@ async fn mint_handler(
     // validation and multi-tenant caller-authorization are later phases.)
     let response = state.gateway.mint(req.policy, req.ttl_seconds);
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// `GET /provision` — return the consumer-setup bundle for the presented halter token
+/// (in `X-Halter-Token` or `Authorization`). The doc carries no real upstream secrets.
+async fn provision_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: http::HeaderMap,
+) -> Response {
+    let Some(token) = crate::core::token_from_headers(&headers) else {
+        return error_response(StatusCode::UNAUTHORIZED, "missing halter token");
+    };
+    match state.gateway.provision(&token) {
+        Some(doc) => (StatusCode::OK, Json(doc)).into_response(),
+        None => error_response(StatusCode::UNAUTHORIZED, "unknown or expired halter token"),
+    }
 }
 
 /// Execute the planned upstream request and relay the response back to the agent.

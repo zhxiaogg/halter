@@ -26,6 +26,7 @@ async fn generic_service_is_proxied_with_its_credential() {
         outbound: Outbound::Bearer {
             credential: "openai-key".into(),
         },
+        address: String::new(),
     }])
     .await;
     halter.add_credential("openai-key", "sk-real-key");
@@ -59,6 +60,7 @@ async fn sse_stream_is_relayed() {
         outbound: Outbound::Bearer {
             credential: "svc-key".into(),
         },
+        address: String::new(),
     }])
     .await;
     halter.add_credential("svc-key", "real");
@@ -96,6 +98,7 @@ async fn unrouted_host_is_denied() {
         outbound: Outbound::Bearer {
             credential: "github-app".into(),
         },
+        address: String::new(),
     }])
     .await;
     halter.add_credential("github-app", "real");

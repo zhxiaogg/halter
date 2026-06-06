@@ -116,6 +116,7 @@ mod tests {
             upstream_base: "https://upstream.example".into(),
             flavor,
             outbound: crate::service::Outbound::Passthrough,
+            address: String::new(),
         }
     }
 

@@ -94,6 +94,60 @@ impl Gateway {
             .mint(policy, ttl_seconds, (self.clock)())
     }
 
+    /// Project a [`ProvisionDoc`] for the consumer holding `token`: the token's bound
+    /// policy ⋈ the service registry. Returns `None` for an unknown/expired token. The
+    /// doc carries no real upstream secrets — only the token, endpoints, and (later) the
+    /// CA.
+    pub fn provision(&self, token: &str) -> Option<models::provision::ProvisionDoc> {
+        let now = (self.clock)();
+        let (policy, expires_at_ms) = self.control.tokens.resolve_full(token, now)?;
+        Some(models::provision::ProvisionDoc {
+            halter_token: token.to_string(),
+            halter_ca: String::new(),
+            expires_at_ms,
+            services: self.provisionable_services(&policy),
+        })
+    }
+
+    /// The services a policy grants the consumer access to: every service whose name a
+    /// rule's `targets` names, or — if any allow rule has empty `targets` (= any
+    /// service) — all of them.
+    fn provisionable_services(
+        &self,
+        policy: &models::policy::Policy,
+    ) -> Vec<models::provision::ProvisionService> {
+        use models::policy::Effect;
+        let mut any_target = false;
+        let mut named: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for rule in &policy.rules {
+            if rule.effect != Effect::Allow {
+                continue;
+            }
+            if rule.matches.targets.is_empty() {
+                any_target = true;
+            }
+            for t in &rule.matches.targets {
+                named.insert(t.as_str());
+            }
+        }
+        self.router
+            .services()
+            .iter()
+            .filter(|s| any_target || named.contains(s.name.as_str()))
+            .map(|s| models::provision::ProvisionService {
+                target: s.name.clone(),
+                flavor: s.flavor.name().to_string(),
+                address: s.address.clone(),
+                mode: match s.outbound {
+                    Outbound::Passthrough => models::provision::ProvisionMode::Passthrough,
+                    Outbound::Bearer { .. } | Outbound::Header { .. } => {
+                        models::provision::ProvisionMode::Inject
+                    }
+                },
+            })
+            .collect()
+    }
+
     /// Authenticate, authorize, and (on allow) plan the upstream forward.
     pub fn handle(&self, req: ProxyRequest) -> Outcome {
         let now = (self.clock)();
@@ -290,6 +344,12 @@ enum AuthSource {
     Authorization,
 }
 
+/// The halter token from a request's headers, ignoring its source. Used by the
+/// `/provision` endpoint, which never forwards, so the channel does not matter.
+pub fn token_from_headers(headers: &http::HeaderMap) -> Option<String> {
+    extract_auth(headers).map(|(token, _)| token)
+}
+
 /// Extract the halter token and where it came from. `X-Halter-Token` is preferred (it
 /// frees `Authorization` for passthrough); otherwise fall back to `Authorization`,
 /// accepting both `Bearer <t>` and GitHub's `token <t>` schemes.
@@ -382,6 +442,7 @@ mod tests {
             outbound: Outbound::Bearer {
                 credential: "github-app".into(),
             },
+            address: String::new(),
         }])
     }
 
@@ -393,6 +454,7 @@ mod tests {
             upstream_base: "https://up.example".into(),
             flavor: Flavor::Generic,
             outbound: Outbound::Passthrough,
+            address: String::new(),
         }])
     }
 
@@ -407,6 +469,7 @@ mod tests {
                 name: "X-API-Key".into(),
                 credential: "keyed-key".into(),
             },
+            address: String::new(),
         }])
     }
 
@@ -652,6 +715,74 @@ mod tests {
             Outcome::Forward(_) => panic!("expected reject"),
         }
         assert_eq!(audit.events()[0].decision, Decision::Deny);
+    }
+
+    fn two_service_router() -> ServiceRouter {
+        ServiceRouter::new(vec![
+            Service {
+                name: "github".into(),
+                host: "api.github.com".into(),
+                upstream_base: "https://api.github.com".into(),
+                flavor: Flavor::Github,
+                outbound: Outbound::Bearer {
+                    credential: "github-app".into(),
+                },
+                address: "https://gh.halter.local".into(),
+            },
+            Service {
+                name: "openai".into(),
+                host: "api.openai.com".into(),
+                upstream_base: "https://api.openai.com".into(),
+                flavor: Flavor::Generic,
+                outbound: Outbound::Passthrough,
+                address: String::new(),
+            },
+        ])
+    }
+
+    fn target_policy(target: &str) -> Policy {
+        Policy {
+            rules: vec![Rule {
+                effect: Effect::Allow,
+                matches: Match {
+                    targets: vec![target.into()],
+                    verbs: vec![],
+                    resources: vec![],
+                    conditions: vec![],
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn provision_lists_only_granted_services() {
+        let (control, _a, _) = test_control();
+        let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000));
+        let minted = gw.mint(target_policy("github"), 60);
+        let doc = gw.provision(&minted.token).unwrap();
+        assert_eq!(doc.halter_token, minted.token);
+        assert_eq!(doc.services.len(), 1);
+        assert_eq!(doc.services[0].target, "github");
+        assert_eq!(doc.services[0].flavor, "github");
+        assert_eq!(doc.services[0].address, "https://gh.halter.local");
+        assert_eq!(
+            doc.services[0].mode,
+            models::provision::ProvisionMode::Inject
+        );
+        // An unknown token yields no doc.
+        assert!(gw.provision("bogus").is_none());
+    }
+
+    #[test]
+    fn provision_empty_targets_lists_all_services() {
+        let (control, _a, _) = test_control();
+        let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000));
+        let minted = gw.mint(allow_all(), 60);
+        let doc = gw.provision(&minted.token).unwrap();
+        assert_eq!(doc.services.len(), 2);
+        // The passthrough service is surfaced as a passthrough mode.
+        let openai = doc.services.iter().find(|s| s.target == "openai").unwrap();
+        assert_eq!(openai.mode, models::provision::ProvisionMode::Passthrough);
     }
 
     #[test]

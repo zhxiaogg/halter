@@ -33,6 +33,10 @@ pub struct ServiceConfig {
     /// Normalization flavor: "github" or "generic" (default).
     #[serde(default)]
     pub flavor: Option<String>,
+    /// Consumer-facing address the agent points its tool at to reach this service through
+    /// halter (surfaced in the provision doc). Optional.
+    #[serde(default)]
+    pub consumer_address: Option<String>,
     /// What halter does with upstream auth on allow: `"passthrough"` (default) forwards
     /// the consumer's own credential; `{ "bearer": "<cred-id>" }` injects it as a Bearer
     /// token; `{ "header": { "name": "X-API-Key", "credential": "<cred-id>" } }` injects

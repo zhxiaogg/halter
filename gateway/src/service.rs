@@ -20,6 +20,14 @@ impl Flavor {
             _ => Flavor::Generic,
         }
     }
+
+    /// The canonical lowercase flavor name (the inverse of [`Flavor::parse`]).
+    pub fn name(self) -> &'static str {
+        match self {
+            Flavor::Github => "github",
+            Flavor::Generic => "generic",
+        }
+    }
 }
 
 /// What halter does with upstream auth when a request is allowed — a closed mechanism
@@ -64,6 +72,9 @@ pub struct Service {
     pub flavor: Flavor,
     /// What halter does with upstream auth on allow.
     pub outbound: Outbound,
+    /// Consumer-facing address the agent points its tool at to reach this service
+    /// through halter (the provision doc surfaces this). Empty if not configured.
+    pub address: String,
 }
 
 /// Routes an inbound request to a service by its `Host`. First match wins, so put more
@@ -81,6 +92,11 @@ impl ServiceRouter {
     pub fn route(&self, host: &str) -> Option<&Service> {
         let host = normalize_host(host);
         self.services.iter().find(|s| host_matches(&s.host, &host))
+    }
+
+    /// All configured services (used to project a provision doc).
+    pub fn services(&self) -> &[Service] {
+        &self.services
     }
 }
 
@@ -120,6 +136,7 @@ mod tests {
             upstream_base: format!("https://{name}.example"),
             flavor: Flavor::Generic,
             outbound: Outbound::Passthrough,
+            address: String::new(),
         }
     }
 

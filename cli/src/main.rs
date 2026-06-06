@@ -95,6 +95,7 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                     credential: credential.clone(),
                 },
             },
+            address: s.consumer_address.clone().unwrap_or_default(),
         })
         .collect();
     tracing::info!(

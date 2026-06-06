@@ -1,0 +1,33 @@
+/// The consumer-side setup bundle the `halter-agent` CLI fetches from `/provision`.
+/// Projected from a token's bound policy ⋈ the service registry. Contains **no real
+/// upstream secrets** — only the halter token, consumer-facing endpoints, and the CA.
+package provision;
+
+/// How the consumer must handle upstream auth for a service.
+enum ProvisionMode {
+    /// halter injects the real upstream credential — the consumer brings nothing.
+    Inject,
+    /// Filter-only — the consumer must supply its own upstream credential.
+    Passthrough,
+}
+
+/// One service the consumer should configure to reach through halter.
+struct ProvisionService {
+    /// Service instance name (`Action.target`).
+    target: String,
+    /// Normalization flavor, e.g. "github" | "generic".
+    flavor: String,
+    /// Consumer-facing address to point the tool at (empty if not configured).
+    address: String,
+    /// Whether halter injects the credential or the consumer must supply its own.
+    mode: ProvisionMode,
+}
+
+/// The setup bundle. Safe to return to the token holder: it carries the halter token the
+/// holder already has, the CA, and endpoints — never a real upstream secret.
+struct ProvisionDoc {
+    halter_token: String,
+    halter_ca: String,
+    expires_at_ms: u64,
+    services: Vec<ProvisionService>,
+}
