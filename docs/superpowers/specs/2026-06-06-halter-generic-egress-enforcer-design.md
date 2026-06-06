@@ -159,16 +159,27 @@ paths. A lenient extractor is a policy bypass.
 
 ## The `Action` / `Verdict` contract
 
-Unchanged as the portability boundary: `Action { target, verb, resource{path, kind}, fields }`,
-`Verdict = Allow{obligations} | Deny{reason}`. The descriptor's `extract` block is **not** a
-new per-service schema — it is the recipe that *fills in this one fixed model* from a raw
-request.
+`Action { target, verb, resource{path, kind}, fields }`,
+`Verdict = Allow{obligations} | Deny{reason}` remains the portability boundary. The
+descriptor's `extract` block is **not** a new per-service schema — it is the recipe that
+*fills in this one fixed model* from a raw request.
 
-**Verb granularity (one decision to settle in implementation).** CRUD verbs fit RESTful
-services but not IAM-action-shaped policy (`ec2:TerminateInstances` ≠ one of four verbs). The
-**catalog action name becomes the matchable unit** for such services — either by opening
-`verb` to a flavor-declared vocabulary or by carrying the action in `fields.action` and
-matching there. The engine is unaffected either way.
+**Verb granularity (decided: open the verb — Option A).** CRUD verbs fit RESTful services but
+not IAM-action-shaped policy (`ec2:TerminateInstances` ≠ one of four verbs). So `verb` is a
+**tagged union**, not a bare CRUD enum:
+
+```
+Verb = Crud(Read | Create | Update | Delete)   // RESTful method mapping
+     | Action(String)                           // service-defined action id, e.g. "ec2:TerminateInstances"
+```
+
+The named action is **first-class and top-level** (it *is* the verb), so a rule reads the way
+authors think about IAM/RBAC — `verbs: ["ec2:DescribeInstances"]` — and the catalog vocabulary
+is the verb vocabulary. The engine's verb-matching handles both arms; it stays exhaustive
+because the union is closed (two arms), preserving the make-illegal-states-unrepresentable
+property — the `Action(String)` arm is the one open vocabulary, scoped to a single field. The
+`extract` recipe decides which arm a service produces (method-map → `Crud`; RPC action parse →
+`Action`).
 
 ## Catalog: the policy-authoring + validation frontend
 
@@ -315,9 +326,9 @@ remove exactly what was added.
   by AKID → REST normalize `verb=Update, resource=my-data/…` → rule `allow PUT my-data/**` →
   re-sign with real account A → forward. No field extraction needed.
 - **aws ec2 — read but not destroy (Tier 1).** Both ops are `POST /`; the action is in the
-  form body. `aws-query` parser extracts `action=DescribeInstances|TerminateInstances` →
-  catalog rule `allow ec2:DescribeInstances`, no grant for `TerminateInstances` → terminate
-  **denied**. Path-glob alone could not distinguish these.
+  form body. The `aws-query` parser sets `verb = Action("ec2:DescribeInstances")` vs
+  `Action("ec2:TerminateInstances")` → rule `allow verbs:["ec2:DescribeInstances"]`, nothing
+  for terminate → terminate falls to default-deny. Path-glob alone could not distinguish these.
 
 ## Verification
 
