@@ -125,6 +125,15 @@ AuthMechanism = Bearer | SigV4 | ApiKeyHeader{name} | Basic | MutualTls | …
 | aws | **SigV4-verify** vs a minted **dummy** credential | **re-sign SigV4** with the real account identity |
 | filter-only (any) | the scheme above | **passthrough** (agent's own credential forwarded unchanged) |
 
+**Token channel (defect fix).** Passthrough needs *two* credentials on one request — the
+halter token (to resolve the policy) **and** the consumer's own upstream credential (to
+forward). They cannot share the `Authorization` slot. So the halter token has a dedicated
+header, **`X-Halter-Token`**: when present, `Authorization` is the consumer's own credential
+and is preserved (passthrough) or overwritten (inject). For single-slot tools (`gh`/`kubectl`,
+which can only set `Authorization`) the token may instead ride `Authorization: Bearer`; halter
+then treats `Authorization` as the halter token and strips it. Rule: *token in `X-Halter-Token`
+⇒ keep `Authorization`; token in `Authorization` ⇒ strip it.*
+
 The **hybrid** stance is exactly the outbound column: `passthrough` = filter-only;
 `inject`/`re-sign` = zero-exposure. Choosable **per rule / per target**. Adding a scheme adds
 one shared variant, never per-service code. SigV4 and EKS/GitHub-App minting are shared

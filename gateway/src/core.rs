@@ -98,7 +98,7 @@ impl Gateway {
     pub fn handle(&self, req: ProxyRequest) -> Outcome {
         let now = (self.clock)();
 
-        let Some(token) = extract_token(&req.headers) else {
+        let Some((token, source)) = extract_auth(&req.headers) else {
             return reject(
                 http::StatusCode::UNAUTHORIZED,
                 DenyReason::Unauthenticated,
@@ -135,22 +135,24 @@ impl Gateway {
             }
             // On allow the outbound credential is the matched service's property, not the
             // policy's — the engine's allow is bare.
-            Verdict::Allow(_) => self.plan_forward(&service, &action, req, now),
+            Verdict::Allow(_) => self.plan_forward(&service, &action, req, source, now),
         }
     }
 
     /// Build the upstream forward plan according to the matched service's outbound
-    /// stance. `Passthrough` forwards the consumer's own credential (the halter token is
-    /// stripped by `sanitize_headers`, so nothing replaces it); `Inject` swaps in the
-    /// target's real credential from the vault. A missing credential fails closed.
+    /// stance. `Passthrough` forwards the consumer's own credential (preserved by
+    /// `sanitize_headers` when the halter token arrived via `X-Halter-Token`); `Inject`
+    /// swaps in the target's real credential from the vault. A missing credential fails
+    /// closed.
     fn plan_forward(
         &self,
         service: &Service,
         action: &Action,
         req: ProxyRequest,
+        source: AuthSource,
         now: u64,
     ) -> Outcome {
-        let mut headers = sanitize_headers(&req.headers);
+        let mut headers = sanitize_headers(&req.headers, source);
 
         let detail = match &service.outbound {
             Outbound::Passthrough => "allowed (passthrough)".to_string(),
@@ -242,26 +244,56 @@ fn reject(status: http::StatusCode, reason: DenyReason, message: &str) -> Outcom
     })
 }
 
-/// Extract the bearer token from the `Authorization` header, accepting both
-/// `Bearer <t>` and GitHub's `token <t>` schemes (case-insensitive scheme).
-fn extract_token(headers: &http::HeaderMap) -> Option<String> {
+/// The dedicated header a consumer uses to present its halter token *without* consuming
+/// the `Authorization` slot — so a filter-only (passthrough) consumer can carry its own
+/// upstream credential in `Authorization` at the same time.
+const HALTER_TOKEN_HEADER: &str = "x-halter-token";
+
+/// Where the halter token was found. This decides whether `Authorization` belongs to
+/// halter (and must be stripped) or to the consumer (and must be preserved for
+/// passthrough).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AuthSource {
+    /// The token came from the dedicated `X-Halter-Token` header; `Authorization` (if
+    /// any) is the consumer's own upstream credential.
+    HalterHeader,
+    /// The token came from `Authorization` itself (e.g. `gh`/`kubectl`, which have only
+    /// one auth slot); `Authorization` is the halter token and must not be forwarded.
+    Authorization,
+}
+
+/// Extract the halter token and where it came from. `X-Halter-Token` is preferred (it
+/// frees `Authorization` for passthrough); otherwise fall back to `Authorization`,
+/// accepting both `Bearer <t>` and GitHub's `token <t>` schemes.
+fn extract_auth(headers: &http::HeaderMap) -> Option<(String, AuthSource)> {
+    if let Some(v) = headers
+        .get(HALTER_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some((v.to_string(), AuthSource::HalterHeader));
+        }
+    }
     let raw = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, value) = raw.split_once(' ')?;
     let scheme = scheme.to_ascii_lowercase();
-    if (scheme == "bearer" || scheme == "token") && !value.is_empty() {
-        Some(value.trim().to_string())
+    if (scheme == "bearer" || scheme == "token") && !value.trim().is_empty() {
+        Some((value.trim().to_string(), AuthSource::Authorization))
     } else {
         None
     }
 }
 
-/// Copy request headers for the upstream, dropping the agent's `Authorization` (the
-/// real credential is injected instead), the inbound `Host` and `Content-Length`
-/// (recomputed by the client), and hop-by-hop headers.
-fn sanitize_headers(headers: &http::HeaderMap) -> http::HeaderMap {
+/// Copy request headers for the upstream, always dropping the `X-Halter-Token` header,
+/// the inbound `Host` and `Content-Length` (recomputed by the client), and hop-by-hop
+/// headers. `Authorization` is dropped only when it carried the halter token
+/// (`source == Authorization`); under `HalterHeader` it is the consumer's own credential
+/// and is preserved for passthrough.
+fn sanitize_headers(headers: &http::HeaderMap, source: AuthSource) -> http::HeaderMap {
     let mut out = http::HeaderMap::new();
     for (name, value) in headers {
-        if is_dropped_header(name) {
+        if is_dropped_header(name, source) {
             continue;
         }
         out.append(name.clone(), value.clone());
@@ -269,7 +301,7 @@ fn sanitize_headers(headers: &http::HeaderMap) -> http::HeaderMap {
     out
 }
 
-fn is_dropped_header(name: &http::HeaderName) -> bool {
+fn is_dropped_header(name: &http::HeaderName, source: AuthSource) -> bool {
     const HOP_BY_HOP: [&str; 8] = [
         "connection",
         "keep-alive",
@@ -281,7 +313,13 @@ fn is_dropped_header(name: &http::HeaderName) -> bool {
         "upgrade",
     ];
     let n = name.as_str().to_ascii_lowercase();
-    n == "authorization" || n == "host" || n == "content-length" || HOP_BY_HOP.contains(&n.as_str())
+    if n == HALTER_TOKEN_HEADER || n == "host" || n == "content-length" {
+        return true;
+    }
+    if n == "authorization" {
+        return source == AuthSource::Authorization;
+    }
+    HOP_BY_HOP.contains(&n.as_str())
 }
 
 #[cfg(test)]
@@ -367,6 +405,21 @@ mod tests {
         h
     }
 
+    /// Headers with the halter token in `X-Halter-Token` and the consumer's own
+    /// credential in `Authorization` (the passthrough shape).
+    fn halter_header_with_own_cred(token: &str, own_cred: &str) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            HALTER_TOKEN_HEADER,
+            http::HeaderValue::from_str(token).unwrap(),
+        );
+        h.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(own_cred).unwrap(),
+        );
+        h
+    }
+
     fn get(headers: http::HeaderMap, path: &str) -> ProxyRequest {
         ProxyRequest {
             method: http::Method::GET,
@@ -431,15 +484,73 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_service_injects_no_credential() {
+    fn passthrough_with_token_in_authorization_forwards_no_credential() {
         let (control, _audit, _) = test_control();
         let gw = Gateway::with_clock(control.clone(), router_passthrough(), fixed_clock(1_000));
         let minted = gw.mint(allow_all(), 60);
-        // Filter-only: the halter token is stripped and nothing replaces it, so no
-        // Authorization header reaches the upstream.
+        // The consumer put the halter token in Authorization and carries no separate
+        // upstream credential → it is stripped, nothing replaces it.
         match gw.handle(get(bearer(&minted.token), "/x")) {
             Outcome::Forward(plan) => {
                 assert!(plan.headers.get(http::header::AUTHORIZATION).is_none());
+            }
+            Outcome::Reject(_) => panic!("expected forward"),
+        }
+    }
+
+    #[test]
+    fn passthrough_preserves_consumers_own_credential() {
+        let (control, _audit, _) = test_control();
+        let gw = Gateway::with_clock(control.clone(), router_passthrough(), fixed_clock(1_000));
+        let minted = gw.mint(allow_all(), 60);
+        // The halter token rides X-Halter-Token; the consumer's own credential in
+        // Authorization is forwarded untouched (the real filter-only behaviour).
+        let headers = halter_header_with_own_cred(&minted.token, "Bearer consumer-own-key");
+        let req = ProxyRequest {
+            method: http::Method::GET,
+            path: "/x".into(),
+            query: String::new(),
+            headers,
+            body: bytes::Bytes::new(),
+        };
+        match gw.handle(req) {
+            Outcome::Forward(plan) => {
+                assert_eq!(
+                    plan.headers
+                        .get(http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("Bearer consumer-own-key")
+                );
+                // The halter token header is not forwarded.
+                assert!(plan.headers.get(HALTER_TOKEN_HEADER).is_none());
+            }
+            Outcome::Reject(_) => panic!("expected forward"),
+        }
+    }
+
+    #[test]
+    fn inject_overrides_consumers_own_credential() {
+        let (control, _audit, _) = test_control();
+        let gw = Gateway::with_clock(control.clone(), router(), fixed_clock(1_000));
+        let minted = gw.mint(allow_all(), 60);
+        // Even if the consumer presents its own credential, inject replaces it with the
+        // target's real secret.
+        let headers = halter_header_with_own_cred(&minted.token, "Bearer consumer-own-key");
+        let req = ProxyRequest {
+            method: http::Method::GET,
+            path: "/repos/o/r".into(),
+            query: String::new(),
+            headers,
+            body: bytes::Bytes::new(),
+        };
+        match gw.handle(req) {
+            Outcome::Forward(plan) => {
+                assert_eq!(
+                    plan.headers
+                        .get(http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("Bearer real-secret-token")
+                );
             }
             Outcome::Reject(_) => panic!("expected forward"),
         }
@@ -483,11 +594,23 @@ mod tests {
     }
 
     #[test]
-    fn extract_token_accepts_both_schemes() {
+    fn extract_auth_prefers_halter_header_then_authorization() {
         let mut h = http::HeaderMap::new();
         h.insert(http::header::AUTHORIZATION, "token abc".parse().unwrap());
-        assert_eq!(extract_token(&h).as_deref(), Some("abc"));
+        assert_eq!(
+            extract_auth(&h),
+            Some(("abc".to_string(), AuthSource::Authorization))
+        );
         h.insert(http::header::AUTHORIZATION, "Bearer xyz".parse().unwrap());
-        assert_eq!(extract_token(&h).as_deref(), Some("xyz"));
+        assert_eq!(
+            extract_auth(&h),
+            Some(("xyz".to_string(), AuthSource::Authorization))
+        );
+        // X-Halter-Token wins over Authorization.
+        h.insert(HALTER_TOKEN_HEADER, "tok-123".parse().unwrap());
+        assert_eq!(
+            extract_auth(&h),
+            Some(("tok-123".to_string(), AuthSource::HalterHeader))
+        );
     }
 }
