@@ -40,7 +40,7 @@ pub fn proxy_router(state: Arc<ServerState>) -> Router {
     Router::new().fallback(proxy_handler).with_state(state)
 }
 
-/// The admin router: `POST /mint` issues a launch token for a registered agent. Bind
+/// The admin router: `POST /mint` issues a launch token for a submitted policy. Bind
 /// this on a separate, localhost-only listener — it is operator/orchestrator surface,
 /// not agent surface.
 pub fn admin_router(state: Arc<ServerState>) -> Router {
@@ -93,10 +93,10 @@ async fn mint_handler(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<MintRequest>,
 ) -> Response {
-    match state.gateway.mint(&req.agent, req.ttl_seconds) {
-        Some(response) => (StatusCode::OK, Json(response)).into_response(),
-        None => error_response(StatusCode::NOT_FOUND, "unknown agent"),
-    }
+    // Any structurally valid policy mints a token — there is no agent identity. (Catalog
+    // validation and multi-tenant caller-authorization are later phases.)
+    let response = state.gateway.mint(req.policy, req.ttl_seconds);
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 /// Execute the planned upstream request and relay the response back to the agent.

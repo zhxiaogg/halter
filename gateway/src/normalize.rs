@@ -5,11 +5,11 @@
 
 use crate::core::ProxyRequest;
 use crate::service::{Flavor, Service};
-use models::action::{Action, Resource, Verb};
+use models::action::{Action, CrudKind, Resource, Verb};
 use serde_json::{Map, Value};
 
-/// Normalize a request to `service` into an `Action` for `agent`.
-pub fn normalize(agent: &str, service: &Service, req: &ProxyRequest) -> Action {
+/// Normalize a request to `service` into an `Action`.
+pub fn normalize(service: &Service, req: &ProxyRequest) -> Action {
     let verb = verb_for(&req.method);
     let path = req.path.trim_start_matches('/');
     let resource = match service.flavor {
@@ -17,19 +17,20 @@ pub fn normalize(agent: &str, service: &Service, req: &ProxyRequest) -> Action {
         Flavor::Generic => generic_resource(path),
     };
     let fields = merge_fields(&req.query, &req.body);
-    Action::of(agent, service.name.clone(), verb, resource).with_fields(fields)
+    Action::of(service.name.clone(), verb, resource).with_fields(fields)
 }
 
-/// Map an HTTP method to a coarse [`Verb`]. Unknown/odd methods map to `Read`, the
+/// Map an HTTP method to a coarse CRUD [`Verb`]. Unknown/odd methods map to `Read`, the
 /// least-privileged verb, so they cannot accidentally satisfy a write rule.
 fn verb_for(method: &http::Method) -> Verb {
-    match *method {
-        http::Method::GET | http::Method::HEAD | http::Method::OPTIONS => Verb::Read,
-        http::Method::POST => Verb::Create,
-        http::Method::PUT | http::Method::PATCH => Verb::Update,
-        http::Method::DELETE => Verb::Delete,
-        _ => Verb::Read,
-    }
+    let kind = match *method {
+        http::Method::GET | http::Method::HEAD | http::Method::OPTIONS => CrudKind::Read,
+        http::Method::POST => CrudKind::Create,
+        http::Method::PUT | http::Method::PATCH => CrudKind::Update,
+        http::Method::DELETE => CrudKind::Delete,
+        _ => CrudKind::Read,
+    };
+    Verb::crud(kind)
 }
 
 /// Generic resource: the full path as the canonical id, with the first path segment as
@@ -114,6 +115,7 @@ mod tests {
             host: "*".into(),
             upstream_base: "https://upstream.example".into(),
             flavor,
+            outbound: crate::service::Outbound::Passthrough,
         }
     }
 
@@ -135,9 +137,9 @@ mod tests {
             "",
             r#"{"base":"main","title":"x"}"#,
         );
-        let a = normalize("agent-1", &service("github", Flavor::Github), &r);
+        let a = normalize(&service("github", Flavor::Github), &r);
         assert_eq!(a.target, "github");
-        assert_eq!(a.verb, Verb::Create);
+        assert_eq!(a.verb, Verb::crud(CrudKind::Create));
         assert_eq!(a.resource.path, "repos/octocat/hello/pulls");
         assert_eq!(a.resource.kind, "pull_request");
         assert_eq!(
@@ -149,7 +151,6 @@ mod tests {
     #[test]
     fn generic_flavor_uses_first_segment_kind() {
         let a = normalize(
-            "a",
             &service("openai", Flavor::Generic),
             &req(
                 http::Method::POST,
@@ -159,7 +160,7 @@ mod tests {
             ),
         );
         assert_eq!(a.target, "openai");
-        assert_eq!(a.verb, Verb::Create);
+        assert_eq!(a.verb, Verb::crud(CrudKind::Create));
         assert_eq!(a.resource.path, "v1/chat/completions");
         assert_eq!(a.resource.kind, "v1");
         assert_eq!(a.fields, serde_json::json!({ "model": "gpt" }));
@@ -167,15 +168,17 @@ mod tests {
 
     #[test]
     fn verbs_map_from_methods() {
-        assert_eq!(verb_for(&http::Method::DELETE), Verb::Delete);
-        assert_eq!(verb_for(&http::Method::PATCH), Verb::Update);
-        assert_eq!(verb_for(&http::Method::HEAD), Verb::Read);
+        assert_eq!(
+            verb_for(&http::Method::DELETE),
+            Verb::crud(CrudKind::Delete)
+        );
+        assert_eq!(verb_for(&http::Method::PATCH), Verb::crud(CrudKind::Update));
+        assert_eq!(verb_for(&http::Method::HEAD), Verb::crud(CrudKind::Read));
     }
 
     #[test]
     fn body_overrides_query_fields() {
         let a = normalize(
-            "a",
             &service("svc", Flavor::Generic),
             &req(
                 http::Method::POST,
@@ -190,7 +193,6 @@ mod tests {
     #[test]
     fn non_json_body_is_ignored_for_fields() {
         let a = normalize(
-            "a",
             &service("svc", Flavor::Generic),
             &req(http::Method::POST, "/x", "", "not json"),
         );

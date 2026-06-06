@@ -22,10 +22,21 @@ impl Flavor {
     }
 }
 
-/// One configured upstream service.
+/// What halter does with upstream auth when a request is allowed. This is the **hybrid**
+/// stance: filter-only by default (`Passthrough`), credential-hiding where it matters
+/// (`Inject`). The credential is a property of the service instance, never named in policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outbound {
+    /// Forward the consumer's own credential unchanged (filter-only).
+    Passthrough,
+    /// Swap in the target's real credential, resolved from the vault by this logical id.
+    Inject { credential: String },
+}
+
+/// One configured upstream service instance.
 #[derive(Clone, Debug)]
 pub struct Service {
-    /// Logical name; becomes `Action.target` and what policy rules scope to.
+    /// Logical instance name; becomes `Action.target` and what policy rules scope to.
     pub name: String,
     /// Host pattern matched against the request `Host` header: an exact host, a
     /// `*.suffix` wildcard, or `*` (catch-all).
@@ -34,6 +45,8 @@ pub struct Service {
     pub upstream_base: String,
     /// How requests to this service are normalized.
     pub flavor: Flavor,
+    /// What halter does with upstream auth on allow.
+    pub outbound: Outbound,
 }
 
 /// Routes an inbound request to a service by its `Host`. First match wins, so put more
@@ -89,6 +102,7 @@ mod tests {
             host: host.into(),
             upstream_base: format!("https://{name}.example"),
             flavor: Flavor::Generic,
+            outbound: Outbound::Passthrough,
         }
     }
 

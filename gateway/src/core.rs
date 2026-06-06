@@ -9,11 +9,11 @@
 //! decision path deterministically testable.
 
 use crate::normalize;
-use crate::service::{Service, ServiceRouter};
+use crate::service::{Outbound, Service, ServiceRouter};
 use control::{ControlPlane, now_ms};
 use models::action::Action;
 use models::audit::{AuditEvent, Decision};
-use models::verdict::{DenyReason, Obligation, Verdict};
+use models::verdict::{DenyReason, Verdict};
 use std::sync::Arc;
 
 /// A normalized inbound request, independent of any HTTP library.
@@ -81,11 +81,17 @@ impl Gateway {
         }
     }
 
-    /// Mint a launch token for `agent`, or `None` if the agent has no registered policy.
-    /// This is the control-plane verb the orchestrator calls at launch.
-    pub fn mint(&self, agent: &str, ttl_seconds: u64) -> Option<models::control::MintResponse> {
-        self.control.registry.policy(agent)?;
-        Some(self.control.tokens.mint(agent, ttl_seconds, (self.clock)()))
+    /// Mint a launch token bound to `policy`. This is the control-plane verb the
+    /// orchestrator calls at launch. Any valid policy mints a token — there is no agent
+    /// identity (multi-tenant caller-authorization, when added, gates this earlier).
+    pub fn mint(
+        &self,
+        policy: models::policy::Policy,
+        ttl_seconds: u64,
+    ) -> models::control::MintResponse {
+        self.control
+            .tokens
+            .mint(policy, ttl_seconds, (self.clock)())
     }
 
     /// Authenticate, authorize, and (on allow) plan the upstream forward.
@@ -99,7 +105,8 @@ impl Gateway {
                 "missing halter token",
             );
         };
-        let Some(agent) = self.control.tokens.resolve(&token, now) else {
+        // The token resolves directly to its bound policy — no agent indirection.
+        let Some(policy) = self.control.tokens.resolve(&token, now) else {
             return reject(
                 http::StatusCode::UNAUTHORIZED,
                 DenyReason::Unauthenticated,
@@ -111,7 +118,7 @@ impl Gateway {
         // (fail closed) — halter only forwards to its allowlist.
         let host = extract_host(&req.headers).unwrap_or_default();
         let Some(service) = self.router.route(&host).cloned() else {
-            self.audit_raw(&agent, &host, Decision::Deny, "no service for host", now);
+            self.audit_raw(&host, Decision::Deny, "no service for host", now);
             return reject(
                 http::StatusCode::NOT_FOUND,
                 DenyReason::UnknownTarget,
@@ -119,79 +126,63 @@ impl Gateway {
             );
         };
 
-        let action = normalize::normalize(&agent, &service, &req);
-
-        let Some(policy) = self.control.registry.policy(&agent) else {
-            self.audit(&action, Decision::Deny, "no policy registered", now);
-            return reject(
-                http::StatusCode::FORBIDDEN,
-                DenyReason::NoPolicy,
-                "agent has no policy",
-            );
-        };
+        let action = normalize::normalize(&service, &req);
 
         match policy::decide(&action, &policy) {
             Verdict::Deny(d) => {
                 self.audit(&action, Decision::Deny, &format!("{:?}", d.reason), now);
                 reject(http::StatusCode::FORBIDDEN, d.reason, "denied by policy")
             }
-            Verdict::Allow(a) => self.plan_forward(&service, &action, &a.obligations, req, now),
+            // On allow the outbound credential is the matched service's property, not the
+            // policy's — the engine's allow is bare.
+            Verdict::Allow(_) => self.plan_forward(&service, &action, req, now),
         }
     }
 
-    /// Build the upstream forward plan, resolving credential obligations against the
-    /// vault. A missing credential fails closed (the agent must never proceed without
-    /// the substitution that hides the real secret).
+    /// Build the upstream forward plan according to the matched service's outbound
+    /// stance. `Passthrough` forwards the consumer's own credential (the halter token is
+    /// stripped by `sanitize_headers`, so nothing replaces it); `Inject` swaps in the
+    /// target's real credential from the vault. A missing credential fails closed.
     fn plan_forward(
         &self,
         service: &Service,
         action: &Action,
-        obligations: &[Obligation],
         req: ProxyRequest,
         now: u64,
     ) -> Outcome {
         let mut headers = sanitize_headers(&req.headers);
-        let mut injected: Vec<String> = Vec::new();
 
-        for obligation in obligations {
-            match obligation {
-                Obligation::InjectCredential(o) => {
-                    let id = &o.credential.id;
-                    let Some(secret) = self.control.credentials.resolve(id) else {
-                        self.audit(
-                            action,
-                            Decision::Deny,
-                            &format!("credential '{id}' not configured"),
-                            now,
-                        );
+        let detail = match &service.outbound {
+            Outbound::Passthrough => "allowed (passthrough)".to_string(),
+            Outbound::Inject { credential } => {
+                let Some(secret) = self.control.credentials.resolve(credential) else {
+                    self.audit(
+                        action,
+                        Decision::Deny,
+                        &format!("credential '{credential}' not configured"),
+                        now,
+                    );
+                    return reject(
+                        http::StatusCode::BAD_GATEWAY,
+                        DenyReason::NotAllowed,
+                        "required credential is not configured",
+                    );
+                };
+                match http::HeaderValue::from_str(&format!("Bearer {}", secret.expose())) {
+                    Ok(value) => {
+                        headers.insert(http::header::AUTHORIZATION, value);
+                    }
+                    Err(_) => {
+                        self.audit(action, Decision::Deny, "credential not header-safe", now);
                         return reject(
                             http::StatusCode::BAD_GATEWAY,
                             DenyReason::NotAllowed,
-                            "required credential is not configured",
+                            "credential is not header-safe",
                         );
-                    };
-                    match http::HeaderValue::from_str(&format!("Bearer {}", secret.expose())) {
-                        Ok(value) => {
-                            headers.insert(http::header::AUTHORIZATION, value);
-                            injected.push(id.clone());
-                        }
-                        Err(_) => {
-                            self.audit(action, Decision::Deny, "credential not header-safe", now);
-                            return reject(
-                                http::StatusCode::BAD_GATEWAY,
-                                DenyReason::NotAllowed,
-                                "credential is not header-safe",
-                            );
-                        }
                     }
                 }
+                format!("allowed; injected [{credential}]")
             }
-        }
-
-        let detail = if injected.is_empty() {
-            "allowed (no credential)".to_string()
-        } else {
-            format!("allowed; injected [{}]", injected.join(", "))
         };
         self.audit(action, Decision::Allow, &detail, now);
 
@@ -206,20 +197,19 @@ impl Gateway {
     fn audit(&self, action: &Action, decision: Decision, detail: &str, now: u64) {
         self.control.audit.record(AuditEvent {
             at_ms: now,
-            agent: action.agent.clone(),
             action: action.clone(),
             decision,
             detail: detail.to_string(),
         });
     }
 
-    /// Audit a decision made before an `Action` exists (e.g. an unroutable host). The
-    /// recorded action carries the raw host so the event is still attributable.
-    fn audit_raw(&self, agent: &str, host: &str, decision: Decision, detail: &str, now: u64) {
+    /// Audit a decision made before a routed `Action` exists (e.g. an unroutable host).
+    /// The recorded action carries the raw host as its target so the event is still
+    /// attributable.
+    fn audit_raw(&self, host: &str, decision: Decision, detail: &str, now: u64) {
         let action = Action::of(
-            agent,
             "<unrouted>",
-            models::action::Verb::Read,
+            models::action::Verb::crud(models::action::CrudKind::Read),
             models::action::Resource::of(host, "host"),
         );
         self.audit(&action, decision, detail, now);
@@ -316,17 +306,31 @@ mod tests {
         (Arc::new(plane), audit, creds)
     }
 
-    /// A catch-all GitHub-flavored service pointing at the real API base.
+    /// A catch-all GitHub-flavored service that injects the `github-app` credential.
     fn router() -> ServiceRouter {
         ServiceRouter::new(vec![Service {
             name: "github".into(),
             host: "*".into(),
             upstream_base: "https://api.github.com".into(),
             flavor: Flavor::Github,
+            outbound: Outbound::Inject {
+                credential: "github-app".into(),
+            },
         }])
     }
 
-    fn allow_all_with_cred() -> Policy {
+    /// A catch-all generic service that forwards the consumer's own credential.
+    fn router_passthrough() -> ServiceRouter {
+        ServiceRouter::new(vec![Service {
+            name: "svc".into(),
+            host: "*".into(),
+            upstream_base: "https://up.example".into(),
+            flavor: Flavor::Generic,
+            outbound: Outbound::Passthrough,
+        }])
+    }
+
+    fn allow_all() -> Policy {
         Policy {
             rules: vec![Rule {
                 effect: Effect::Allow,
@@ -336,7 +340,20 @@ mod tests {
                     resources: vec![],
                     conditions: vec![],
                 },
-                grant_credentials: vec!["github-app".into()],
+            }],
+        }
+    }
+
+    fn read_only() -> Policy {
+        Policy {
+            rules: vec![Rule {
+                effect: Effect::Allow,
+                matches: Match {
+                    targets: vec![],
+                    verbs: vec![models::action::Verb::crud(models::action::CrudKind::Read)],
+                    resources: vec![],
+                    conditions: vec![],
+                },
             }],
         }
     }
@@ -388,11 +405,10 @@ mod tests {
     }
 
     #[test]
-    fn allowed_request_injects_credential_and_strips_agent_token() {
+    fn allowed_request_injects_targets_credential() {
         let (control, audit, _) = test_control();
-        control.registry.register("agent-1", allow_all_with_cred());
         let gw = Gateway::with_clock(control.clone(), router(), fixed_clock(1_000));
-        let minted = gw.mint("agent-1", 60).unwrap();
+        let minted = gw.mint(allow_all(), 60);
 
         match gw.handle(get(bearer(&minted.token), "/repos/octocat/hello")) {
             Outcome::Forward(plan) => {
@@ -403,7 +419,7 @@ mod tests {
                     .unwrap()
                     .to_str()
                     .unwrap();
-                // The agent's token is gone; the real secret is in its place.
+                // The consumer's token is gone; the target's real secret is in its place.
                 assert_eq!(auth, "Bearer real-secret-token");
                 assert!(!auth.contains(&minted.token));
             }
@@ -415,12 +431,26 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_service_injects_no_credential() {
+        let (control, _audit, _) = test_control();
+        let gw = Gateway::with_clock(control.clone(), router_passthrough(), fixed_clock(1_000));
+        let minted = gw.mint(allow_all(), 60);
+        // Filter-only: the halter token is stripped and nothing replaces it, so no
+        // Authorization header reaches the upstream.
+        match gw.handle(get(bearer(&minted.token), "/x")) {
+            Outcome::Forward(plan) => {
+                assert!(plan.headers.get(http::header::AUTHORIZATION).is_none());
+            }
+            Outcome::Reject(_) => panic!("expected forward"),
+        }
+    }
+
+    #[test]
     fn expired_token_is_unauthorized() {
         let (control, _a, _) = test_control();
-        control.registry.register("agent-1", allow_all_with_cred());
         // Mint at t=1000 with 60s TTL → expires at 61_000.
         let gw_mint = Gateway::with_clock(control.clone(), router(), fixed_clock(1_000));
-        let minted = gw_mint.mint("agent-1", 60).unwrap();
+        let minted = gw_mint.mint(allow_all(), 60);
         // Handle at t=61_000 (expired).
         let gw = Gateway::with_clock(control, router(), fixed_clock(61_000));
         match gw.handle(get(bearer(&minted.token), "/repos/o/r")) {
@@ -433,23 +463,8 @@ mod tests {
     fn denied_request_is_forbidden_and_audited() {
         let (control, audit, _) = test_control();
         // Policy allows only reads; a DELETE falls through to default-deny.
-        control.registry.register(
-            "agent-1",
-            Policy {
-                rules: vec![Rule {
-                    effect: Effect::Allow,
-                    matches: Match {
-                        targets: vec![],
-                        verbs: vec![models::action::Verb::Read],
-                        resources: vec![],
-                        conditions: vec![],
-                    },
-                    grant_credentials: vec!["github-app".into()],
-                }],
-            },
-        );
         let gw = Gateway::with_clock(control, router(), fixed_clock(1_000));
-        let minted = gw.mint("agent-1", 60).unwrap();
+        let minted = gw.mint(read_only(), 60);
         let del = ProxyRequest {
             method: http::Method::DELETE,
             path: "/repos/o/r".into(),
@@ -465,28 +480,6 @@ mod tests {
             Outcome::Forward(_) => panic!("expected reject"),
         }
         assert_eq!(audit.events()[0].decision, Decision::Deny);
-    }
-
-    #[test]
-    fn authenticated_agent_without_policy_is_forbidden() {
-        let (control, _a, _) = test_control();
-        // Register so mint succeeds, then the policy lookup at handle time still finds
-        // a policy — so to exercise NoPolicy we mint a token then remove via a fresh
-        // control without the agent. Simpler: mint manually against tokens table.
-        let now = 1_000;
-        let minted = control.tokens.mint("ghost", 60, now);
-        let gw = Gateway::with_clock(control, router(), fixed_clock(now));
-        match gw.handle(get(bearer(&minted.token), "/repos/o/r")) {
-            Outcome::Reject(r) => assert_eq!(r.reason, DenyReason::NoPolicy),
-            Outcome::Forward(_) => panic!("expected reject"),
-        }
-    }
-
-    #[test]
-    fn mint_unknown_agent_returns_none() {
-        let (control, _a, _) = test_control();
-        let gw = Gateway::new(control, router());
-        assert!(gw.mint("nobody", 60).is_none());
     }
 
     #[test]
