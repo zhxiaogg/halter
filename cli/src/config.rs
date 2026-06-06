@@ -1,9 +1,9 @@
 //! halter server configuration. This is application/storage config — hand-written and
 //! deliberately *not* a fluorite type — so it can evolve independently of the wire
-//! protocol. It seeds the control plane (agents → policies, credential vault) and the
-//! gateway route at startup.
+//! protocol. It seeds the gateway's service allowlist (with each service's outbound auth
+//! stance) and the credential vault at startup. There are no agents: tokens are minted
+//! per-policy via the admin API.
 
-use models::policy::Policy;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -17,17 +17,14 @@ pub struct Config {
     /// The upstream HTTPS services halter will proxy to (the allowlist). Routed by Host.
     pub services: Vec<ServiceConfig>,
     /// Logical credential id → real secret. Provisioned out of band; never exposed to
-    /// agents.
+    /// consumers.
     #[serde(default)]
     pub credentials: HashMap<String, String>,
-    /// Agents and their standing policies (Option 3).
-    #[serde(default)]
-    pub agents: Vec<AgentConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceConfig {
-    /// Logical service name; becomes `Action.target` and what policy rules scope to.
+    /// Logical instance name; becomes `Action.target` and what policy rules scope to.
     pub name: String,
     /// Host pattern matched against the request `Host`: exact, `*.suffix`, or `*`.
     pub host: String,
@@ -36,12 +33,22 @@ pub struct ServiceConfig {
     /// Normalization flavor: "github" or "generic" (default).
     #[serde(default)]
     pub flavor: Option<String>,
+    /// What halter does with upstream auth on allow: `"passthrough"` (default) forwards
+    /// the consumer's own credential; `{ "inject": "<cred-id>" }` swaps in the target's
+    /// real credential.
+    #[serde(default)]
+    pub outbound: OutboundConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AgentConfig {
-    pub id: String,
-    pub policy: Policy,
+/// The configured outbound auth stance for a service (see [`ServiceConfig::outbound`]).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutboundConfig {
+    /// Forward the consumer's own credential unchanged (filter-only).
+    #[default]
+    Passthrough,
+    /// Swap in the target's real credential, named by its vault id.
+    Inject(String),
 }
 
 impl Config {
@@ -64,24 +71,43 @@ mod tests {
             "proxy_addr": "127.0.0.1:9090",
             "admin_addr": "127.0.0.1:9091",
             "services": [
-                { "name": "github", "host": "api.github.com", "upstream_base": "https://api.github.com", "flavor": "github" }
+                { "name": "github", "host": "api.github.com", "upstream_base": "https://api.github.com",
+                  "flavor": "github", "outbound": { "inject": "github-app" } },
+                { "name": "openai", "host": "api.openai.com", "upstream_base": "https://api.openai.com",
+                  "flavor": "generic", "outbound": "passthrough" }
             ],
-            "credentials": { "github-app": "secret" },
-            "agents": [
-                { "id": "agent-1", "policy": { "rules": [
-                    { "effect": "Allow",
-                      "matches": { "targets": [], "verbs": ["Read"], "resources": [], "conditions": [] },
-                      "grantCredentials": ["github-app"] }
-                ] } }
-            ]
+            "credentials": { "github-app": "secret" }
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.proxy_addr, "127.0.0.1:9090");
-        assert_eq!(cfg.agents.len(), 1);
-        assert_eq!(cfg.agents[0].policy.rules.len(), 1);
+        assert_eq!(cfg.services.len(), 2);
+        assert!(matches!(
+            cfg.services[0].outbound,
+            OutboundConfig::Inject(ref id) if id == "github-app"
+        ));
+        assert!(matches!(
+            cfg.services[1].outbound,
+            OutboundConfig::Passthrough
+        ));
         assert_eq!(
             cfg.credentials.get("github-app").map(String::as_str),
             Some("secret")
         );
+    }
+
+    #[test]
+    fn outbound_defaults_to_passthrough() {
+        let json = r#"{
+            "proxy_addr": "127.0.0.1:9090",
+            "admin_addr": "127.0.0.1:9091",
+            "services": [
+                { "name": "svc", "host": "*", "upstream_base": "https://up.example" }
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            cfg.services[0].outbound,
+            OutboundConfig::Passthrough
+        ));
     }
 }

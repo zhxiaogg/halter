@@ -6,48 +6,18 @@
       "name": "github",
       "host": "api.github.com",
       "upstream_base": "https://api.github.com",
-      "flavor": "github"
+      "flavor": "github",
+      "outbound": { "inject": "github-app" }
     },
     {
       "name": "openai",
       "host": "api.openai.com",
       "upstream_base": "https://api.openai.com",
-      "flavor": "generic"
+      "flavor": "generic",
+      "outbound": "passthrough"
     }
   ],
   "credentials": {
-    "github-app": "ghs_REPLACE_WITH_REAL_INSTALLATION_TOKEN",
-    "openai-key": "sk-REPLACE_WITH_REAL_KEY"
-  },
-  "agents": [
-    {
-      "id": "reviewer-bot",
-      "policy": {
-        "rules": [
-          {
-            "effect": "Allow",
-            "matches": {
-              "targets": [],
-              "verbs": ["Read"],
-              "resources": ["repos/octocat/*/**"],
-              "conditions": []
-            },
-            "grantCredentials": ["github-app"]
-          },
-          {
-            "effect": "Allow",
-            "matches": {
-              "targets": [],
-              "verbs": ["Create"],
-              "resources": ["repos/octocat/*/pulls"],
-              "conditions": [
-                { "type": "Equals", "value": { "field": "base", "value": "develop" } }
-              ]
-            },
-            "grantCredentials": ["github-app"]
-          }
-        ]
-      }
-    }
-  ]
+    "github-app": "ghs_REPLACE_WITH_REAL_INSTALLATION_TOKEN"
+  }
 }

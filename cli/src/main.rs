@@ -1,17 +1,18 @@
 //! `halter` — the CLI entry point.
 //!
 //! `halter serve --config <file>` starts the reverse proxy + admin API from a config
-//! file. `halter mint --admin-url <url> --agent <id> --ttl <secs>` calls a running
-//! server's admin API to issue a launch token (handy for manual testing; in production
-//! the orchestrator calls the admin API directly).
+//! file. `halter mint --admin-url <url> --policy <file> --ttl <secs>` calls a running
+//! server's admin API to issue a launch token bound to that policy (handy for manual
+//! testing; in production the orchestrator calls the admin API directly).
 
 mod config;
 
 use clap::{Parser, Subcommand};
-use config::Config;
+use config::{Config, OutboundConfig};
 use control::{ControlPlane, InMemoryCredentials, Secret, TracingAudit};
-use gateway::{Flavor, Gateway, Service, ServiceRouter};
+use gateway::{Flavor, Gateway, Outbound, Service, ServiceRouter};
 use models::control::{MintRequest, MintResponse};
+use models::policy::Policy;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -28,7 +29,7 @@ struct Cli {
 enum Command {
     /// Start the reverse proxy and admin API.
     Serve(ServeArgs),
-    /// Mint a launch token for an agent via a running server's admin API.
+    /// Mint a launch token bound to a policy file, via a running server's admin API.
     Mint(MintArgs),
 }
 
@@ -44,9 +45,9 @@ struct MintArgs {
     /// Base URL of the admin API, e.g. http://127.0.0.1:9091
     #[arg(long)]
     admin_url: String,
-    /// Agent id to mint a token for.
+    /// Path to a JSON policy document to bind the token to.
     #[arg(long)]
-    agent: String,
+    policy: std::path::PathBuf,
     /// Token lifetime in seconds.
     #[arg(long, default_value_t = 3600)]
     ttl: u64,
@@ -76,11 +77,6 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         credentials.insert(id.clone(), Secret::new(secret.clone()));
     }
     let control = Arc::new(ControlPlane::new(credentials, Arc::new(TracingAudit)));
-    for agent in &cfg.agents {
-        control
-            .registry
-            .register(agent.id.clone(), agent.policy.clone());
-    }
     let services: Vec<Service> = cfg
         .services
         .iter()
@@ -89,10 +85,15 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             host: s.host.clone(),
             upstream_base: s.upstream_base.clone(),
             flavor: Flavor::parse(s.flavor.as_deref()),
+            outbound: match &s.outbound {
+                OutboundConfig::Passthrough => Outbound::Passthrough,
+                OutboundConfig::Inject(id) => Outbound::Inject {
+                    credential: id.clone(),
+                },
+            },
         })
         .collect();
     tracing::info!(
-        agents = cfg.agents.len(),
         credentials = cfg.credentials.len(),
         services = services.len(),
         "loaded config"
@@ -106,11 +107,16 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Call a running server's admin API to mint a token, and print the response as JSON.
+/// Call a running server's admin API to mint a token bound to a policy file, and print
+/// the response as JSON.
 async fn mint(args: MintArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(&args.policy)
+        .map_err(|e| format!("read policy {}: {e}", args.policy.display()))?;
+    let policy: Policy = serde_json::from_str(&text)
+        .map_err(|e| format!("parse policy {}: {e}", args.policy.display()))?;
     let url = format!("{}/mint", args.admin_url.trim_end_matches('/'));
     let body = MintRequest {
-        agent: args.agent,
+        policy,
         ttl_seconds: args.ttl,
     };
     let resp = reqwest::Client::new().post(&url).json(&body).send().await?;

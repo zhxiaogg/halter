@@ -7,7 +7,7 @@
 use axum::Router;
 use axum::extract::State;
 use control::{ControlPlane, InMemoryAudit, InMemoryCredentials, Secret};
-use gateway::{Flavor, Gateway, ServerState, Service, ServiceRouter};
+use gateway::{Flavor, Gateway, Outbound, ServerState, Service, ServiceRouter};
 use models::policy::Policy;
 use std::sync::{Arc, Mutex};
 
@@ -100,29 +100,25 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// Register an agent's standing policy.
-    pub fn register(&self, agent: &str, policy: Policy) {
-        self.control.registry.register(agent, policy);
-    }
-
     /// Seed a credential into the vault.
     pub fn add_credential(&self, id: &str, secret: &str) {
         self.credentials.insert(id, Secret::new(secret));
     }
 
-    /// Mint a launch token via the admin API (exercising that endpoint too).
-    pub async fn mint(&self, agent: &str, ttl_seconds: u64) -> reqwest::Response {
+    /// Mint a launch token bound to `policy` via the admin API (exercising that endpoint
+    /// too).
+    pub async fn mint(&self, policy: &Policy, ttl_seconds: u64) -> reqwest::Response {
         reqwest::Client::new()
             .post(format!("{}/mint", self.admin_url))
-            .json(&serde_json::json!({ "agent": agent, "ttlSeconds": ttl_seconds }))
+            .json(&serde_json::json!({ "policy": policy, "ttlSeconds": ttl_seconds }))
             .send()
             .await
             .unwrap()
     }
 
     /// Mint and return just the token string (asserts success).
-    pub async fn mint_token(&self, agent: &str, ttl_seconds: u64) -> String {
-        let resp = self.mint(agent, ttl_seconds).await;
+    pub async fn mint_token(&self, policy: &Policy, ttl_seconds: u64) -> String {
+        let resp = self.mint(policy, ttl_seconds).await;
         assert!(resp.status().is_success(), "mint failed: {}", resp.status());
         let value: serde_json::Value = resp.json().await.unwrap();
         value["token"].as_str().unwrap().to_string()
@@ -137,6 +133,9 @@ pub async fn start_halter(upstream_base: &str) -> Harness {
         host: "*".to_string(),
         upstream_base: upstream_base.to_string(),
         flavor: Flavor::Github,
+        outbound: Outbound::Inject {
+            credential: "github-app".to_string(),
+        },
     }])
     .await
 }

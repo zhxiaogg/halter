@@ -1,16 +1,15 @@
 //! e2e tests for the generalized capabilities: any HTTPS service (Host-routed,
 //! fail-closed allowlist) and any transport (HTTP request/response and SSE streaming).
 
-use gateway::{Flavor, Service};
+use gateway::{Flavor, Outbound, Service};
 use models::policy::Policy;
 use tests::{start_halter_services, start_mock_upstream};
 
-fn allow_all(cred: &str) -> Policy {
-    serde_json::from_str(&format!(
-        r#"{{ "rules": [ {{ "effect": "Allow",
-            "matches": {{ "targets": [], "verbs": [], "resources": [], "conditions": [] }},
-            "grantCredentials": ["{cred}"] }} ] }}"#
-    ))
+fn allow_all() -> Policy {
+    serde_json::from_str(
+        r#"{ "rules": [ { "effect": "Allow",
+            "matches": { "targets": [], "verbs": [], "resources": [], "conditions": [] } } ] }"#,
+    )
     .expect("valid policy")
 }
 
@@ -24,11 +23,13 @@ async fn generic_service_is_proxied_with_its_credential() {
         host: "*".into(),
         upstream_base: upstream.base_url.clone(),
         flavor: Flavor::Generic,
+        outbound: Outbound::Inject {
+            credential: "openai-key".into(),
+        },
     }])
     .await;
     halter.add_credential("openai-key", "sk-real-key");
-    halter.register("agent-1", allow_all("openai-key"));
-    let token = halter.mint_token("agent-1", 3600).await;
+    let token = halter.mint_token(&allow_all(), 3600).await;
 
     let resp = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", halter.proxy_url))
@@ -55,11 +56,13 @@ async fn sse_stream_is_relayed() {
         host: "*".into(),
         upstream_base: upstream.base_url.clone(),
         flavor: Flavor::Generic,
+        outbound: Outbound::Inject {
+            credential: "svc-key".into(),
+        },
     }])
     .await;
     halter.add_credential("svc-key", "real");
-    halter.register("agent-1", allow_all("svc-key"));
-    let token = halter.mint_token("agent-1", 3600).await;
+    let token = halter.mint_token(&allow_all(), 3600).await;
 
     let resp = reqwest::Client::new()
         .get(format!("{}/v1/stream", halter.proxy_url))
@@ -90,11 +93,13 @@ async fn unrouted_host_is_denied() {
         host: "api.github.com".into(),
         upstream_base: upstream.base_url.clone(),
         flavor: Flavor::Github,
+        outbound: Outbound::Inject {
+            credential: "github-app".into(),
+        },
     }])
     .await;
     halter.add_credential("github-app", "real");
-    halter.register("agent-1", allow_all("github-app"));
-    let token = halter.mint_token("agent-1", 3600).await;
+    let token = halter.mint_token(&allow_all(), 3600).await;
 
     let resp = reqwest::Client::new()
         .get(format!("{}/repos/o/r", halter.proxy_url))
