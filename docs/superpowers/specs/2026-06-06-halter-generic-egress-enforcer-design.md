@@ -354,3 +354,35 @@ remove exactly what was added.
   concrete target.
 - **Gate:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test --workspace`.
+
+## Implementation status (2026-06-06)
+
+Built and green (`make check`), beyond the Phase-1 spine:
+
+- **Token channel** — `X-Halter-Token` dual-channel so passthrough forwards the consumer's
+  own credential (defect fixed).
+- **Auth mechanism library** — `Outbound = Passthrough | Bearer | Header{name} | SigV4{…}`.
+  SigV4 is a from-scratch `ring`-based signer (SHA-256 + HMAC), unit-tested against the AWS
+  documented signing-key vector and a sign↔verify round-trip; the `Outbound::SigV4` arm
+  re-signs allowed requests with the real account credential (the consumer never holds it).
+- **Provisioning** — `ProvisionDoc` + token-authenticated `GET /provision` (policy ⋈ service
+  registry, no real secrets), and a `halter-agent` consumer CLI (`show`/`env`/`status`/`setup`).
+- **Extraction** — `Protocol = Rest | AwsQuery | AwsJson` (operation from body/header,
+  fail-closed sentinel verb), form-body field extraction, and `{bucket}/{key+}` path templates.
+- **Catalog + validation** — per-target action catalog with fail-closed mint-time validation
+  (unknown named action → reject); static config source today.
+- **Multi-tenant mint authorization** — `X-Halter-Tenant` credential + owned-targets table +
+  subset check (empty-target allow rules rejected for tenants).
+
+Residuals (each a contained extension, not a redesign):
+
+- **SigV4 *inbound*** — verifying a minted dummy AKID *as the policy-identifying token* (so the
+  `aws` CLI signs and halter routes by the signed AKID). Today an AWS-target consumer presents a
+  halter token via `X-Halter-Token` to identify the policy, and halter re-signs outbound; the
+  signer's `verify` is implemented and tested, ready to drive this path.
+- **Catalog ingesters** — live k8s discovery / OpenAPI / botocore-SAR sources produce the same
+  `Catalog` set; only the static source is wired.
+- **`halter-agent` native writers** — `setup` writes an env file + summary; per-tool
+  kubeconfig/`~/.aws`/git writers build on the same provision doc.
+- **Transport** — `Upgrade`/streaming subresources and transparent-MITM mode (per *Out of
+  scope*).
