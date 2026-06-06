@@ -1,0 +1,269 @@
+# halter — generic policy-enforcing egress proxy (redesign)
+
+**Status:** design approved, pre-implementation. **Date:** 2026-06-06.
+**Supersedes:** the GitHub-centric model in `2026-06-04-halter-jit-agent-access-design.md`
+(and its "any HTTPS service" addendum). The pure policy engine and the `Action`/`Verdict`
+portability boundary survive unchanged; everything else generalizes.
+
+## What changes, and why
+
+Three drivers, surfaced by stress-testing the v1 model against GitHub, EKS/k8s, and the
+AWS CLI:
+
+1. **Any HTTPS service, registered by an admin — no built-in service flavors.** v1 had a
+   hardcoded GitHub normalizer and a single `Bearer` injection path. We replace per-service
+   *code* with a per-service **descriptor** (data) interpreted by one generic pipeline.
+2. **No agent identity.** v1 bound a token to a pre-registered `agent` whose policy lived in
+   a registry. Now a caller submits a **policy document** and, if it validates, receives a
+   token bound to that policy. A separate entity uses the token to proxy requests.
+3. **Credential handling is optional and per-rule (hybrid).** halter becomes an **L7 egress
+   policy enforcer** first. By default the consumer brings its own credential and halter only
+   allows/denies + audits. A rule *may* additionally inject/hide a credential where
+   zero-exposure matters — paying per-scheme complexity only for the services that need it.
+
+## Roles and what each party sees
+
+Three roles (v1 conflated the first two):
+
+- **Operator** — runs halter; registers services with their address, type, auth mechanism,
+  and (for injection) the real credential. **The only party that holds real credentials.**
+- **Minter** — submits a **policy document + TTL** to the admin API; receives an **opaque
+  token** (or, for SigV4 upstreams, a minted **dummy credential**). Sees service/target
+  *names* and the action vocabulary — **never a real secret**.
+- **Consumer** — holds only the token + the halter endpoint; drops it into `gh`/`kubectl`/
+  `aws`/an SDK. **Never sees a real credential.** In injection mode it never sees the upstream
+  secret; in filter-only mode it carries its *own* credential, which halter passes through.
+
+**TLS / what halter sees.** Content-aware policy (verb, path, body conditions) requires
+plaintext, which requires halter to **terminate TLS** on the consumer→halter leg. The
+consumer points its client at halter (`GH_HOST`, kubeconfig `server`, `AWS_ENDPOINT_URL`) and
+trusts halter's own cert via explicit per-sandbox config (`AWS_CA_BUNDLE`, kubeconfig
+`certificate-authority-data`, or plain HTTP on localhost). This is **not** MITM and **not**
+system-CA distribution — halter presents its own identity; the client is knowingly pointed at
+it. Consequence: halter sees the consumer's `Authorization` header in plaintext even in
+filter-only mode. "Filter on the body" and "see the credential" are the same property; what a
+rule controls is only whether halter *swaps* the credential or passes it through.
+
+The only alternative — filtering without decrypting — degrades to a host/SNI allowlist (no
+verb/path/body policy), which the sandbox layer already does. So termination is required for
+the policy halter exists to enforce.
+
+## Architecture: one generic pipeline
+
+The policy engine stays pure and decoupled (`decide(&Action, &Policy) -> Verdict`). All
+protocol-specific knowledge lives in **data** (the service descriptor) interpreted by a
+single data-plane pipeline. Per request:
+
+```
+leg-1 TLS terminate
+  └─▶ [1] authenticate inbound        (auth mechanism: bearer | sigv4 | apikey | mtls …)
+      └─▶ [2] route → target instance (by address for REST; by inbound identity for SigV4)
+          └─▶ [3] normalize → Action  (RESTful method+path default; or declared RPC parser)
+              └─▶ decide(Action, Policy)
+                  └─▶ on allow: [4] apply outbound credential
+                                   (passthrough | inject bearer | re-sign sigv4 | mTLS)
+                      └─▶ forward → stream response → audit
+```
+
+Steps 1–4 are the descriptor's surface. The proxy, engine, audit, and token model are
+service-agnostic and never learn which service they are handling.
+
+## Service model: type vs instance
+
+The v1 `Service` conflated *type* (protocol/auth) with *instance* (a concrete cluster/
+account). We split them:
+
+- **Service type** — declares the **auth mechanism**, the **wire protocol** (for extraction),
+  and **how its catalog is resolved**. Shared across instances.
+- **Service instance** — binds a type to a concrete **endpoint** + **credential** (+ for
+  injection, the real identity). This is the `target` the policy and audit name.
+
+`Action.target` is the **instance name** (`eks-prod`, `aws-acct-A`), not the type. Policy
+scopes by target; the **credential is a property of the target**, resolved by halter and
+**never named in the policy** (this closes the v1 credential-laundering hole and lets policy
+authors reference targets, not secrets).
+
+### Model resolution — four strategies (admin chooses at registration)
+
+Registration provides `{type, address, credential, auth}` together, so the catalog can be
+resolved immediately, before any mint (no chicken-and-egg). The model is **one ingested
+artifact with two projections**: a **catalog** (authoring + validation) and a **recognizer**
+(runtime extraction).
+
+| Strategy | Example | Catalog source | Refresh scope |
+|---|---|---|---|
+| **a. live-discovery** | k8s | the cluster's discovery API + OpenAPI (uses the instance credential) | per-instance, periodic (CRDs are per-cluster) |
+| **b. embedded** | aws | vendored botocore models + Service Authorization Reference | per-type, regen on upgrade |
+| **c. openapi** | any documented HTTPS API | an OpenAPI doc the admin supplies (URL/path) | per-type, on change |
+| **d. raw / none** | anything | none — author writes raw `method + path` matches | n/a |
+
+Lifecycle, strictly ordered:
+
+```
+register instance → resolve model (cache catalog + recognizer) → mint (validate) → enforce
+```
+
+A stale-cache miss at mint triggers an on-demand refresh.
+
+## Auth mechanisms (a closed, shared library)
+
+Auth is **not** per-service code. The world's HTTP auth schemes are a closed sum type,
+selected per service for both inbound (authenticate the caller) and outbound (apply the real
+credential on allow):
+
+```
+AuthMechanism = Bearer | SigV4 | ApiKeyHeader{name} | Basic | MutualTls | …
+```
+
+| Service | inbound (verify caller) | outbound (on allow) |
+|---|---|---|
+| github | Bearer (halter token) | inject Bearer (GitHub-App token; mint + rotate) |
+| k8s | Bearer | inject Bearer (EKS `get-token`; mint + rotate) |
+| aws | **SigV4-verify** vs a minted **dummy** credential | **re-sign SigV4** with the real account identity |
+| filter-only (any) | the scheme above | **passthrough** (agent's own credential forwarded unchanged) |
+
+The **hybrid** stance is exactly the outbound column: `passthrough` = filter-only;
+`inject`/`re-sign` = zero-exposure. Choosable **per rule / per target**. Adding a scheme adds
+one shared variant, never per-service code. SigV4 and EKS/GitHub-App minting are shared
+**credential providers** that mint/rotate/sign — referenced by config, implemented once.
+
+## Normalization / extraction
+
+Extraction generalizes to a single declared dimension — the **wire protocol** — which the
+service model declares (so extraction is *inherited* from the catalog strategy, not separately
+configured):
+
+| Protocol | Operation lives in | Extractor | Covers |
+|---|---|---|---|
+| **RESTful** (default) | HTTP method + URL path | one generic `method + path` engine | strategies a, c, d **and** S3 — the majority |
+| **aws-query / aws-json** | `Action=` form body / `X-Amz-Target` header | one closed parser each, driven by the embedded model | strategy b (AWS non-S3) |
+| *(future: graphql, json-rpc)* | query body / `method` field | add a parser when needed | — |
+
+Three of four strategies use the one RESTful extractor with **zero per-service code**; only
+AWS pulls a protocol parser, itself generic over all of AWS.
+
+**Tiers of expressiveness (pay only for what you need):**
+- **Tier 0 — method + path glob (zero config).** Covers every RESTful service for coarse
+  "which verb on which path" rules. E.g. `allow PUT my-data/**`. `fields` unused.
+- **Tier 1 — + field extraction (opt-in).** Required when (a) the operation isn't in the path
+  (AWS query/JSON, GraphQL, JSON-RPC — path is constant), or (b) policy needs **value-level**
+  conditions (e.g. PRs only against `base=develop`). Sources fields from path-template
+  captures, query, headers, or body (JSONPath / XPath / form).
+
+**Strict + fail-closed.** Generic extraction must canonicalize and **deny on ambiguity** —
+unparseable body for the declared content type, duplicate query/JSON keys, non-canonical
+paths. A lenient extractor is a policy bypass.
+
+## The `Action` / `Verdict` contract
+
+Unchanged as the portability boundary: `Action { target, verb, resource{path, kind}, fields }`,
+`Verdict = Allow{obligations} | Deny{reason}`. The descriptor's `extract` block is **not** a
+new per-service schema — it is the recipe that *fills in this one fixed model* from a raw
+request.
+
+**Verb granularity (one decision to settle in implementation).** CRUD verbs fit RESTful
+services but not IAM-action-shaped policy (`ec2:TerminateInstances` ≠ one of four verbs). The
+**catalog action name becomes the matchable unit** for such services — either by opening
+`verb` to a flavor-declared vocabulary or by carrying the action in `fields.action` and
+matching there. The engine is unaffected either way.
+
+## Catalog: the policy-authoring + validation frontend
+
+The catalog (from strategy a/b/c) gives policy authors a **named vocabulary** instead of path
+globs — exactly how they already think (IAM actions, k8s RBAC verbs×resources, GitHub
+permissions). It is sugar **above** the generic `Action`: a catalog action **compiles down** to
+the low-level matcher.
+
+```
+allow s3:PutObject on my-data/*   ──(catalog: how is PutObject recognized?)──▶
+  match { verb: Update, resource: "my-data/*" }   ← what decide() sees
+```
+
+Both forms coexist: the **raw** form (`allow PUT my-data/**`) is the simple default and the
+escape hatch; the **catalog** form is the ergonomic, validated form.
+
+**Validation at mint, two tiers (see Mint below):** catalog-backed references are checked
+semantically (unknown → reject, fail closed); raw matches are checked only structurally.
+Where the catalog knows them, **condition keys** are validated too (AWS SAR enumerates them;
+OpenAPI params supply them).
+
+## Multiplicity (N clusters, N accounts)
+
+`target` is an instance name, so N instances are just N descriptors of the same type. The
+**routing key differs by how a service is addressed**, an asymmetry worth designing for:
+
+- **k8s (N clusters): disambiguate by address.** Each cluster is a distinct endpoint; the
+  consumer uses distinct kubeconfig contexts. Give each cluster a distinct halter
+  hostname (`prod.k8s.halter.local`, one wildcard cert) or path-prefix; route by it.
+- **aws (N accounts): disambiguate by identity.** AWS endpoints are region-scoped, not
+  account-scoped — accounts differ only by credential. Mint a **distinct dummy AKID per
+  account**; the consumer selects via `AWS_PROFILE`; halter maps dummy AKID → real account.
+  Endpoint comes from the SigV4 scope (region+service); account from the credential.
+
+So routing generalizes from "the Host header" to a **mechanism-aware** `route(request) → target`:
+address for REST, inbound identity for SigV4.
+
+## Mint and token (no agent)
+
+The control plane mints a token from a **policy document + TTL**. There is no agent registry.
+
+- For bearer upstreams the token is an opaque capability bound to the policy.
+- For SigV4 upstreams the minted artifact is a **dummy credential pair** (the consumer's
+  tooling signs with it; halter verifies then re-signs). The token envelope therefore varies by
+  the consumer's auth scheme; the policy→token binding is identical.
+
+**Validation against the service model** (per confirmed design):
+- catalog-backed actions/resources/targets → **semantic** check, reject on unknown (fail closed);
+- raw matches → **structural** check only (opting out of semantic validation, by design);
+- validated against the **cached** model from registration (on-demand refresh on miss).
+
+In the single-trust-domain local setup, the mint endpoint is localhost-bound and admin =
+minter, so "valid policy → token" is safe. Caller-authorization becomes necessary only with
+multiple trust domains (see Deferred).
+
+## Out of scope / deferred
+
+- **Multi-tenant mint authorization.** When one halter serves multiple trust domains, add:
+  (1) an authenticated mint caller (tenant), (2) a tenant→owned-targets table, (3) a
+  subset check `referenced_targets(policy) ⊆ tenant.owned_targets` (fail closed). Purely
+  additive to the control-plane mint path; engine, contract, and data plane unchanged. Kept
+  out now: single domain, localhost mint.
+- **Transport gaps.** `Upgrade`/streaming subresources — `kubectl exec`/`port-forward`/
+  `logs -f`/`watch` (SPDY/WebSocket) and large streaming S3 uploads
+  (`STREAMING-…-PAYLOAD`/multipart). Plain request/response (incl. SSE) is in scope; `aws s3
+  presign` is client-side and bypasses halter → unsupported (fails closed).
+- **Additional RPC parsers** (GraphQL, JSON-RPC) — add when a registered service needs one.
+- **Cedar/CEL** behind `decide` — optional, still hidden by the engine boundary.
+
+## Worked examples
+
+- **github — PRs only against `develop`.** `POST /repos/o/r/pulls` body `{"base":"main"}`.
+  Bearer-in (halter token) → route by Host → REST normalize: `verb=Create`,
+  `resource="repos/o/r/pulls"`, `fields={base:"main"}` → rule `allow Create on repos/*/*/pulls
+  if base==develop` → `main≠develop` → **deny**. Allowed PRs inject the GitHub-App token.
+- **k8s — read pods in `dev`.** kubeconfig `server`→halter, static `token`=halter token, CA=
+  halter cert. `kubectl get pods -n dev` → Bearer-in → route by per-cluster host → REST
+  normalize `verb=Read, resource=api/v1/namespaces/dev/pods` → allow → inject EKS `get-token`
+  → forward. Consumer never saw AWS creds or the EKS token.
+- **aws s3 — write to one bucket (Tier 0).** `AWS_ENDPOINT_URL`→halter, dummy cred,
+  `AWS_CA_BUNDLE`=halter cert. `aws s3 cp f s3://my-data/…` → SigV4-verify dummy → route by
+  AKID → REST normalize `verb=Update, resource=my-data/…` → rule `allow PUT my-data/**` →
+  re-sign with real account A → forward. No field extraction needed.
+- **aws ec2 — read but not destroy (Tier 1).** Both ops are `POST /`; the action is in the
+  form body. `aws-query` parser extracts `action=DescribeInstances|TerminateInstances` →
+  catalog rule `allow ec2:DescribeInstances`, no grant for `TerminateInstances` → terminate
+  **denied**. Path-glob alone could not distinguish these.
+
+## Verification
+
+- **Unit:** engine (unchanged); auth-mechanism library (bearer extract, SigV4 verify/sign);
+  the RESTful extractor and each RPC parser (canonicalization + fail-closed on ambiguity);
+  catalog resolution per strategy; mint-time validation (semantic reject vs structural pass);
+  routing (address vs inbound-identity).
+- **e2e:** live server + mock upstreams proving — REST allow/deny with credential
+  passthrough *and* injection; SigV4 re-sign (dummy verified, real signature upstream,
+  consumer secret absent); k8s discovery-backed catalog validation; AWS Tier-1 action
+  extraction gating destroy; unknown-target/unknown-action mint rejection; every decision
+  audited with the concrete target.
+- **Gate:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --workspace`.
