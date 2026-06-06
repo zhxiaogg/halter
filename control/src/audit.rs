@@ -41,7 +41,7 @@ pub struct TracingAudit;
 impl AuditSink for TracingAudit {
     fn record(&self, event: AuditEvent) {
         tracing::info!(
-            agent = %event.agent,
+            target = %event.action.target,
             decision = ?event.decision,
             resource = %event.action.resource.path,
             verb = ?event.action.verb,
@@ -55,7 +55,7 @@ impl AuditSink for TracingAudit {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use models::action::{Action, Resource, Verb};
+    use models::action::{Action, CrudKind, Resource, Verb};
     use models::audit::Decision;
 
     #[test]
@@ -64,8 +64,11 @@ mod tests {
         for (i, decision) in [Decision::Allow, Decision::Deny].into_iter().enumerate() {
             sink.record(AuditEvent {
                 at_ms: i as u64,
-                agent: "a".into(),
-                action: Action::of("a", "github", Verb::Read, Resource::of("repos/o/r", "repo")),
+                action: Action::of(
+                    "github",
+                    Verb::crud(CrudKind::Read),
+                    Resource::of("repos/o/r", "repo"),
+                ),
                 decision,
                 detail: String::new(),
             });

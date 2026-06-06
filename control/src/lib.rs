@@ -1,11 +1,10 @@
-//! halter control plane: the agent→policy registry, short-lived token minting, the
-//! credential vault, and the audit sink. The data plane ([`gateway`]) holds an
-//! `Arc<ControlPlane>` and consults it on every request; the policy engine ([`policy`])
-//! never touches any of this — it stays pure.
+//! halter control plane: short-lived policy-bound token minting, the credential vault,
+//! and the audit sink. The data plane ([`gateway`]) holds an `Arc<ControlPlane>` and
+//! consults it on every request; the policy engine ([`policy`]) never touches any of
+//! this — it stays pure. There is no agent registry: a token *is* a policy binding.
 
 pub mod audit;
 pub mod credentials;
-pub mod registry;
 pub mod tokens;
 
 use std::sync::Arc;
@@ -13,7 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use audit::{AuditSink, InMemoryAudit, TracingAudit};
 pub use credentials::{CredentialStore, InMemoryCredentials, Secret};
-pub use registry::Registry;
 pub use tokens::Tokens;
 
 /// Wall-clock time in Unix epoch milliseconds. The control-plane core takes time as a
@@ -28,7 +26,6 @@ pub fn now_ms() -> u64 {
 /// credential store and audit sink are trait objects so they can be swapped without
 /// touching the data plane.
 pub struct ControlPlane {
-    pub registry: Registry,
     pub tokens: Tokens,
     pub credentials: Arc<dyn CredentialStore>,
     pub audit: Arc<dyn AuditSink>,
@@ -38,7 +35,6 @@ impl ControlPlane {
     /// Assemble a control plane from its components.
     pub fn new(credentials: Arc<dyn CredentialStore>, audit: Arc<dyn AuditSink>) -> Self {
         Self {
-            registry: Registry::new(),
             tokens: Tokens::new(),
             credentials,
             audit,
