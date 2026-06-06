@@ -36,15 +36,10 @@ pub fn empty_fields() -> serde_json::Value {
 
 impl action::Action {
     /// Ergonomic constructor with an empty `fields` object (the generated `new` requires
-    /// every field, including `fields`, positionally). `target` is the service name.
-    pub fn of(
-        agent: impl Into<String>,
-        target: impl Into<String>,
-        verb: action::Verb,
-        resource: action::Resource,
-    ) -> Self {
+    /// every field, including `fields`, positionally). `target` is the service instance
+    /// name.
+    pub fn of(target: impl Into<String>, verb: action::Verb, resource: action::Resource) -> Self {
         Self {
-            agent: agent.into(),
             target: target.into(),
             verb,
             resource,
@@ -57,6 +52,18 @@ impl action::Action {
     pub fn with_fields(mut self, fields: serde_json::Value) -> Self {
         self.fields = fields;
         self
+    }
+}
+
+impl action::Verb {
+    /// A coarse CRUD verb (RESTful method mapping).
+    pub fn crud(kind: action::CrudKind) -> Self {
+        action::Verb::Crud(action::CrudVerb { kind })
+    }
+
+    /// A named, service-defined action (e.g. "s3:PutObject").
+    pub fn action(id: impl Into<String>) -> Self {
+        action::Verb::Action(action::NamedVerb { id: id.into() })
     }
 }
 
@@ -77,18 +84,22 @@ impl verdict::Verdict {
         matches!(self, verdict::Verdict::Allow(_))
     }
 
-    /// Allow with the given credential-injection obligations.
-    pub fn allow(credentials: Vec<verdict::CredentialRef>) -> Self {
-        verdict::Verdict::Allow(verdict::AllowVerdict {
-            obligations: credentials
-                .into_iter()
-                .map(|credential| {
-                    verdict::Obligation::InjectCredential(verdict::InjectCredentialObligation {
-                        credential,
-                    })
-                })
-                .collect(),
+    /// Allow with explicit obligations. The data plane builds these from the matched
+    /// service instance (inject its credential, or pass the consumer's through).
+    pub fn allow(obligations: Vec<verdict::Obligation>) -> Self {
+        verdict::Verdict::Allow(verdict::AllowVerdict { obligations })
+    }
+
+    /// An obligation to inject the named credential upstream.
+    pub fn inject(id: impl Into<String>) -> verdict::Obligation {
+        verdict::Obligation::InjectCredential(verdict::InjectCredentialObligation {
+            credential: verdict::CredentialRef { id: id.into() },
         })
+    }
+
+    /// An obligation to forward the consumer's own credential unchanged.
+    pub fn passthrough() -> verdict::Obligation {
+        verdict::Obligation::Passthrough(verdict::PassthroughObligation {})
     }
 
     /// Deny with the given reason.
@@ -100,15 +111,14 @@ impl verdict::Verdict {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::action::{Action, Resource, Verb};
-    use super::verdict::{CredentialRef, DenyReason, Verdict};
+    use super::action::{Action, CrudKind, Resource, Verb};
+    use super::verdict::{DenyReason, Verdict};
 
     #[test]
     fn action_round_trips_through_json() {
         let action = Action::of(
-            "agent-1",
             "github",
-            Verb::Create,
+            Verb::crud(CrudKind::Create),
             Resource::of("repos/octocat/hello/pulls", "pull_request"),
         )
         .with_fields(serde_json::json!({ "base": "main" }));
@@ -118,9 +128,22 @@ mod tests {
     }
 
     #[test]
+    fn verb_union_supports_crud_and_named_action() {
+        let read = Verb::crud(CrudKind::Read);
+        let terminate = Verb::action("ec2:TerminateInstances");
+        assert_ne!(read, terminate);
+        let json = serde_json::to_string(&terminate).unwrap();
+        let back: Verb = serde_json::from_str(&json).unwrap();
+        assert_eq!(terminate, back);
+    }
+
+    #[test]
     fn verdict_helpers_build_expected_variants() {
-        let allow = Verdict::allow(vec![CredentialRef { id: "gh".into() }]);
+        let allow = Verdict::allow(vec![Verdict::inject("gh")]);
         assert!(allow.is_allow());
+
+        let passthrough = Verdict::allow(vec![Verdict::passthrough()]);
+        assert!(passthrough.is_allow());
 
         let deny = Verdict::deny(DenyReason::NotAllowed);
         assert!(!deny.is_allow());

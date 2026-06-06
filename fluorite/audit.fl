@@ -9,13 +9,12 @@ enum Decision {
     Deny,
 }
 
-/// One immutable audit record: which agent attempted what, and what halter decided.
+/// One immutable audit record: what was attempted, and what halter decided.
 struct AuditEvent {
     /// Unix epoch milliseconds when the decision was made.
     at_ms: u64,
-    agent: String,
     action: Action,
     decision: Decision,
-    /// Human-readable detail: the deny reason, or the credential ids injected on allow.
+    /// Human-readable detail: the deny reason, or the credential injected on allow.
     detail: String,
 }

@@ -27,9 +27,13 @@ enum DenyReason {
 #[type_tag = "type"]
 union Obligation {
     InjectCredential(InjectCredentialObligation),
+    Passthrough(PassthroughObligation),
 }
 
 struct InjectCredentialObligation { credential: CredentialRef }
+
+/// Forward the consumer's own credential unchanged (filter-only / hybrid mode).
+struct PassthroughObligation {}
 
 struct AllowVerdict { obligations: Vec<Obligation> }
 

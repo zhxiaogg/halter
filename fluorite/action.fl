@@ -4,12 +4,28 @@
 /// This is the portability boundary that lets the engine outlive any single proxy.
 package action;
 
-/// The operation kind, abstracted over a protocol's concrete verbs (HTTP method, etc.).
-enum Verb {
+/// The CRUD operation kinds RESTful services map onto from the HTTP method.
+enum CrudKind {
     Read,
     Create,
     Update,
     Delete,
+}
+
+/// A coarse CRUD verb — the RESTful method mapping.
+struct CrudVerb { kind: CrudKind }
+
+/// A service-defined action id, e.g. "ec2:TerminateInstances" (RPC-style services whose
+/// operation does not fit CRUD). This is the one open vocabulary, scoped to this field.
+struct NamedVerb { id: String }
+
+/// The operation, abstracted over a protocol's concrete verbs. A closed tagged union: the
+/// `Crud` arm is the closed RESTful set; the `Action` arm carries the open, service-defined
+/// vocabulary. The engine matches by equality over both arms (exhaustive, fail-closed).
+#[type_tag = "type"]
+union Verb {
+    Crud(CrudVerb),
+    Action(NamedVerb),
 }
 
 /// The resource an action addresses, parsed from the request by an adapter.
@@ -23,10 +39,8 @@ struct Resource {
 
 /// One normalized operation, the sole input to the policy engine.
 struct Action {
-    /// The agent on whose behalf the request is made (resolved from the halter token).
-    agent: String,
-    /// The configured service this targets (e.g. "github", "openai") — the routing key
-    /// halter matched, and what policy rules scope to.
+    /// The configured service instance this targets (e.g. "github", "eks-prod") — the
+    /// routing key halter matched, and what policy rules scope to.
     target: String,
     verb: Verb,
     resource: Resource,

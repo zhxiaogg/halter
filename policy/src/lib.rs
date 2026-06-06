@@ -7,12 +7,13 @@
 //! reuse it by translating its request into an `Action` and enforcing the `Verdict`.
 //!
 //! Semantics: rules are evaluated top-to-bottom, **first match wins**, and if no rule
-//! matches the action is **denied** (fail closed). An `Allow` rule's
-//! `grant_credentials` become credential-injection obligations the data plane fulfills.
+//! matches the action is **denied** (fail closed). An `Allow` is **bare**: the engine
+//! names no credentials — the matched service instance owns its credential, and the data
+//! plane attaches the inject/passthrough obligation.
 
 use models::action::{Action, Verb};
 use models::policy::{Condition, Effect, Match, Policy, Rule};
-use models::verdict::{CredentialRef, DenyReason, Verdict};
+use models::verdict::{DenyReason, Verdict};
 use serde_json::Value;
 
 /// Decide whether `action` is permitted under `policy`.
@@ -28,15 +29,12 @@ pub fn decide(action: &Action, policy: &Policy) -> Verdict {
     Verdict::deny(DenyReason::NotAllowed)
 }
 
-/// Build the verdict a matched rule produces.
+/// Build the verdict a matched rule produces. An `Allow` is **bare** — the engine no
+/// longer names credentials (the matched service instance owns them); the data plane
+/// attaches the inject/passthrough obligation from the routed target.
 fn verdict_for(rule: &Rule) -> Verdict {
     match rule.effect {
-        Effect::Allow => Verdict::allow(
-            rule.grant_credentials
-                .iter()
-                .map(|id| CredentialRef { id: id.clone() })
-                .collect(),
-        ),
+        Effect::Allow => Verdict::allow(vec![]),
         Effect::Deny => Verdict::deny(DenyReason::ExplicitDeny),
     }
 }
@@ -111,7 +109,7 @@ fn lookup<'a>(fields: &'a Value, path: &str) -> Option<&'a Value> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use models::action::{Action, Resource, Verb};
+    use models::action::{Action, CrudKind, Resource, Verb};
     use models::policy::{
         Condition, Effect, EqualsCondition, ExistsCondition, Match, OneOfCondition, Policy, Rule,
     };
@@ -126,11 +124,10 @@ mod tests {
         }
     }
 
-    fn allow(matches: Match, creds: &[&str]) -> Rule {
+    fn allow(matches: Match) -> Rule {
         Rule {
             effect: Effect::Allow,
             matches,
-            grant_credentials: creds.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -138,15 +135,13 @@ mod tests {
         Rule {
             effect: Effect::Deny,
             matches,
-            grant_credentials: vec![],
         }
     }
 
     fn pr_create() -> Action {
         Action::of(
-            "agent-1",
             "github",
-            Verb::Create,
+            Verb::crud(CrudKind::Create),
             Resource::of("repos/octocat/hello/pulls", "pull_request"),
         )
     }
@@ -161,24 +156,43 @@ mod tests {
     }
 
     #[test]
-    fn matching_allow_rule_grants_with_credentials() {
+    fn matching_allow_rule_yields_bare_allow() {
         let policy = Policy {
-            rules: vec![allow(
-                Match {
-                    verbs: vec![Verb::Create],
-                    resources: vec!["repos/octocat/*/pulls".into()],
-                    ..empty_match()
-                },
-                &["github-app"],
-            )],
+            rules: vec![allow(Match {
+                verbs: vec![Verb::crud(CrudKind::Create)],
+                resources: vec!["repos/octocat/*/pulls".into()],
+                ..empty_match()
+            })],
         };
-        let v = decide(&pr_create(), &policy);
-        match v {
-            Verdict::Allow(a) => {
-                assert_eq!(a.obligations.len(), 1);
-            }
+        match decide(&pr_create(), &policy) {
+            // The engine no longer names credentials; allow is bare, the data plane
+            // attaches the target's inject/passthrough obligation.
+            Verdict::Allow(a) => assert!(a.obligations.is_empty()),
             Verdict::Deny(_) => panic!("expected allow"),
         }
+    }
+
+    #[test]
+    fn named_verb_matches_named_rule() {
+        let describe = Action::of(
+            "aws-acct-a",
+            Verb::action("ec2:DescribeInstances"),
+            Resource::of("", "root"),
+        );
+        let policy = Policy {
+            rules: vec![allow(Match {
+                verbs: vec![Verb::action("ec2:DescribeInstances")],
+                ..empty_match()
+            })],
+        };
+        assert!(decide(&describe, &policy).is_allow());
+        // A different named action falls through to default-deny.
+        let terminate = Action::of(
+            "aws-acct-a",
+            Verb::action("ec2:TerminateInstances"),
+            Resource::of("", "root"),
+        );
+        assert!(!decide(&terminate, &policy).is_allow());
     }
 
     #[test]
@@ -186,10 +200,10 @@ mod tests {
         let policy = Policy {
             rules: vec![
                 deny(Match {
-                    verbs: vec![Verb::Create],
+                    verbs: vec![Verb::crud(CrudKind::Create)],
                     ..empty_match()
                 }),
-                allow(empty_match(), &["github-app"]),
+                allow(empty_match()),
             ],
         };
         let v = decide(&pr_create(), &policy);
@@ -203,18 +217,14 @@ mod tests {
     fn read_only_agent_denied_create() {
         // Allow only reads; a create falls through to default-deny.
         let policy = Policy {
-            rules: vec![allow(
-                Match {
-                    verbs: vec![Verb::Read],
-                    ..empty_match()
-                },
-                &["github-app"],
-            )],
+            rules: vec![allow(Match {
+                verbs: vec![Verb::crud(CrudKind::Read)],
+                ..empty_match()
+            })],
         };
         let read = Action::of(
-            "agent-1",
             "github",
-            Verb::Read,
+            Verb::crud(CrudKind::Read),
             Resource::of("repos/octocat/hello", "repo"),
         );
         assert!(decide(&read, &policy).is_allow());
@@ -225,18 +235,15 @@ mod tests {
     fn condition_gates_on_field_value() {
         // May open PRs, but only against base "develop".
         let policy = Policy {
-            rules: vec![allow(
-                Match {
-                    verbs: vec![Verb::Create],
-                    resources: vec!["repos/*/*/pulls".into()],
-                    conditions: vec![Condition::Equals(EqualsCondition {
-                        field: "base".into(),
-                        value: serde_json::json!("develop"),
-                    })],
-                    ..empty_match()
-                },
-                &["github-app"],
-            )],
+            rules: vec![allow(Match {
+                verbs: vec![Verb::crud(CrudKind::Create)],
+                resources: vec!["repos/*/*/pulls".into()],
+                conditions: vec![Condition::Equals(EqualsCondition {
+                    field: "base".into(),
+                    value: serde_json::json!("develop"),
+                })],
+                ..empty_match()
+            })],
         };
         let to_develop = pr_create().with_fields(serde_json::json!({ "base": "develop" }));
         let to_main = pr_create().with_fields(serde_json::json!({ "base": "main" }));
@@ -247,24 +254,18 @@ mod tests {
     #[test]
     fn one_of_and_exists_conditions() {
         let policy = Policy {
-            rules: vec![allow(
-                Match {
-                    conditions: vec![
-                        Condition::OneOf(OneOfCondition {
-                            field: "base".into(),
-                            values: vec![
-                                serde_json::json!("develop"),
-                                serde_json::json!("staging"),
-                            ],
-                        }),
-                        Condition::Exists(ExistsCondition {
-                            field: "title".into(),
-                        }),
-                    ],
-                    ..empty_match()
-                },
-                &["github-app"],
-            )],
+            rules: vec![allow(Match {
+                conditions: vec![
+                    Condition::OneOf(OneOfCondition {
+                        field: "base".into(),
+                        values: vec![serde_json::json!("develop"), serde_json::json!("staging")],
+                    }),
+                    Condition::Exists(ExistsCondition {
+                        field: "title".into(),
+                    }),
+                ],
+                ..empty_match()
+            })],
         };
         let ok = pr_create().with_fields(serde_json::json!({ "base": "staging", "title": "x" }));
         let no_title = pr_create().with_fields(serde_json::json!({ "base": "staging" }));

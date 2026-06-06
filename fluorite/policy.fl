@@ -43,13 +43,11 @@ struct Match {
 }
 
 /// A single policy rule. Rules are evaluated in order; the first whose `matches` matches
-/// the action determines the outcome.
+/// the action determines the outcome. Credentials are NOT named here — the matched service
+/// instance owns its credential, so policy authors reference targets, not secrets.
 struct Rule {
     effect: Effect,
     matches: Match,
-    /// Logical credential ids to inject upstream when this rule allows the action.
-    /// Ignored for `Deny` rules.
-    grant_credentials: Vec<String>,
 }
 
 /// The full ordered rule set for one agent. If no rule matches, the action is denied.
