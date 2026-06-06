@@ -20,6 +20,10 @@ pub struct Config {
     /// consumers.
     #[serde(default)]
     pub credentials: HashMap<String, String>,
+    /// Multi-tenant mint authorization: tenant credential → the target names it owns.
+    /// Empty = single trust domain (open minting on the localhost admin API).
+    #[serde(default)]
+    pub tenants: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

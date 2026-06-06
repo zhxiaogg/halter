@@ -92,12 +92,24 @@ async fn proxy_handler(
 
 async fn mint_handler(
     State(state): State<Arc<ServerState>>,
+    headers: http::HeaderMap,
     Json(req): Json<MintRequest>,
 ) -> Response {
-    // Any structurally valid policy mints a token — there is no agent identity. (Catalog
-    // validation and multi-tenant caller-authorization are later phases.)
-    let response = state.gateway.mint(req.policy, req.ttl_seconds);
-    (StatusCode::OK, Json(response)).into_response()
+    // No agent identity: a structurally valid policy mints a token. When tenants are
+    // configured, the `X-Halter-Tenant` credential must own every target the policy names
+    // (fail closed); single-trust-domain deployments leave tenancy unconfigured (open).
+    let tenant = headers
+        .get("x-halter-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    match state
+        .gateway
+        .mint_checked(req.policy, req.ttl_seconds, tenant)
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(message) => error_response(StatusCode::FORBIDDEN, &message),
+    }
 }
 
 /// `GET /provision` — return the consumer-setup bundle for the presented halter token

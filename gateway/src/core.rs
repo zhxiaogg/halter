@@ -94,6 +94,28 @@ impl Gateway {
             .mint(policy, ttl_seconds, (self.clock)())
     }
 
+    /// Mint with multi-tenant authorization. When no tenants are configured (single trust
+    /// domain) this is open and equals [`Gateway::mint`]. Otherwise a valid `tenant`
+    /// credential is required and the policy may only name targets that tenant owns —
+    /// fail closed, closing the credential-laundering hole.
+    pub fn mint_checked(
+        &self,
+        policy: models::policy::Policy,
+        ttl_seconds: u64,
+        tenant: Option<&str>,
+    ) -> Result<models::control::MintResponse, String> {
+        if !self.control.tenants.is_empty() {
+            let key = tenant.ok_or("missing tenant credential")?;
+            let owned = self
+                .control
+                .tenants
+                .owned(key)
+                .ok_or("unknown tenant credential")?;
+            validate_tenant_policy(&policy, &owned)?;
+        }
+        Ok(self.mint(policy, ttl_seconds))
+    }
+
     /// Project a [`ProvisionDoc`] for the consumer holding `token`: the token's bound
     /// policy ⋈ the service registry. Returns `None` for an unknown/expired token. The
     /// doc carries no real upstream secrets — only the token, endpoints, and (later) the
@@ -324,6 +346,30 @@ fn reject(status: http::StatusCode, reason: DenyReason, message: &str) -> Outcom
         reason,
         message: message.to_string(),
     })
+}
+
+/// Validate a tenant-submitted policy: every `Allow` rule must name explicit targets, all
+/// owned by the tenant. An empty-targets allow rule would grant *any* service — unsafe
+/// across trust domains — so it is rejected for tenants.
+fn validate_tenant_policy(
+    policy: &models::policy::Policy,
+    owned: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    use models::policy::Effect;
+    for rule in &policy.rules {
+        if rule.effect != Effect::Allow {
+            continue;
+        }
+        if rule.matches.targets.is_empty() {
+            return Err("tenant allow rules must name explicit targets".to_string());
+        }
+        for t in &rule.matches.targets {
+            if !owned.contains(t.as_str()) {
+                return Err(format!("target '{t}' is not owned by this tenant"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The dedicated header a consumer uses to present its halter token *without* consuming
@@ -776,6 +822,39 @@ mod tests {
         );
         // An unknown token yields no doc.
         assert!(gw.provision("bogus").is_none());
+    }
+
+    #[test]
+    fn mint_is_open_when_no_tenants_configured() {
+        let (control, _a, _) = test_control();
+        let gw = Gateway::with_clock(control, router(), fixed_clock(1_000));
+        assert!(gw.mint_checked(allow_all(), 60, None).is_ok());
+    }
+
+    #[test]
+    fn tenant_may_only_mint_owned_targets() {
+        let (control, _a, _) = test_control();
+        control.tenants.insert("t-a", ["github".to_string()]);
+        let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000));
+        // With tenants configured, a missing tenant credential is rejected.
+        assert!(gw.mint_checked(target_policy("github"), 60, None).is_err());
+        // Owned target → ok.
+        assert!(
+            gw.mint_checked(target_policy("github"), 60, Some("t-a"))
+                .is_ok()
+        );
+        // Unowned target → err.
+        assert!(
+            gw.mint_checked(target_policy("openai"), 60, Some("t-a"))
+                .is_err()
+        );
+        // An empty-targets (any-service) allow rule is rejected for tenants.
+        assert!(gw.mint_checked(allow_all(), 60, Some("t-a")).is_err());
+        // Unknown tenant → err.
+        assert!(
+            gw.mint_checked(target_policy("github"), 60, Some("ghost"))
+                .is_err()
+        );
     }
 
     #[test]

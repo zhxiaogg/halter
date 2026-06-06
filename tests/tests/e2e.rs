@@ -148,6 +148,49 @@ async fn missing_or_invalid_token_is_unauthorized() {
     assert!(!upstream.was_called());
 }
 
+/// User story: with tenants configured, a tenant may only mint tokens for targets it owns.
+#[tokio::test]
+async fn tenant_mint_is_scoped_to_owned_targets() {
+    let upstream = start_mock_upstream().await;
+    let halter = start_halter(&upstream.base_url).await;
+    // The single catch-all service is named "github"; tenant-a owns only it.
+    halter
+        .control
+        .tenants
+        .insert("tenant-a", ["github".to_string()]);
+    let client = reqwest::Client::new();
+
+    let mint = |tenant: Option<&str>, target: &str| {
+        let body = serde_json::json!({
+            "policy": { "rules": [ { "effect": "Allow", "matches": {
+                "targets": [target], "verbs": [], "resources": [], "conditions": [] } } ] },
+            "ttlSeconds": 60,
+        });
+        let mut r = client
+            .post(format!("{}/mint", halter.admin_url))
+            .json(&body);
+        if let Some(t) = tenant {
+            r = r.header("X-Halter-Tenant", t);
+        }
+        r.send()
+    };
+
+    // Owned target → 200.
+    assert_eq!(
+        mint(Some("tenant-a"), "github").await.unwrap().status(),
+        200
+    );
+    // Unowned target → 403.
+    assert_eq!(
+        mint(Some("tenant-a"), "openai").await.unwrap().status(),
+        403
+    );
+    // Missing tenant credential (tenants configured) → 403.
+    assert_eq!(mint(None, "github").await.unwrap().status(), 403);
+    // Unknown tenant → 403.
+    assert_eq!(mint(Some("ghost"), "github").await.unwrap().status(), 403);
+}
+
 /// User story: a consumer fetches its setup bundle from `/provision` with its token.
 #[tokio::test]
 async fn provision_returns_setup_bundle() {

@@ -77,6 +77,9 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         credentials.insert(id.clone(), Secret::new(secret.clone()));
     }
     let control = Arc::new(ControlPlane::new(credentials, Arc::new(TracingAudit)));
+    for (key, targets) in &cfg.tenants {
+        control.tenants.insert(key.clone(), targets.iter().cloned());
+    }
     let services: Vec<Service> = cfg
         .services
         .iter()

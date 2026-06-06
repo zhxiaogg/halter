@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod credentials;
+pub mod tenants;
 pub mod tokens;
 
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use audit::{AuditSink, InMemoryAudit, TracingAudit};
 pub use credentials::{CredentialStore, InMemoryCredentials, Secret};
+pub use tenants::Tenants;
 pub use tokens::Tokens;
 
 /// Wall-clock time in Unix epoch milliseconds. The control-plane core takes time as a
@@ -27,6 +29,7 @@ pub fn now_ms() -> u64 {
 /// touching the data plane.
 pub struct ControlPlane {
     pub tokens: Tokens,
+    pub tenants: Tenants,
     pub credentials: Arc<dyn CredentialStore>,
     pub audit: Arc<dyn AuditSink>,
 }
@@ -36,6 +39,7 @@ impl ControlPlane {
     pub fn new(credentials: Arc<dyn CredentialStore>, audit: Arc<dyn AuditSink>) -> Self {
         Self {
             tokens: Tokens::new(),
+            tenants: Tenants::new(),
             credentials,
             audit,
         }
