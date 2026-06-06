@@ -1,23 +1,42 @@
 //! Request → [`Action`] normalization. This is the protocol adapter: it turns a raw
-//! HTTP request into the engine's protocol-agnostic `Action`. Normalization is generic
-//! by default (any HTTP/JSON or SSE service); a service can opt into a richer [`Flavor`]
-//! (e.g. GitHub) for nicer resource kinds. A future K8s/Envoy adapter is a sibling here.
+//! HTTP request into the engine's protocol-agnostic `Action`. RESTful by default
+//! (method + path; a [`Flavor`] adds nicer resource kinds); RPC protocols
+//! ([`Protocol::AwsQuery`]/[`Protocol::AwsJson`]) read the operation from the body/header
+//! and set a named [`Verb`]. Extraction is **strict, fail-closed**: an RPC request whose
+//! operation can't be parsed gets an unmatchable verb so no allow rule fires.
 
 use crate::core::ProxyRequest;
-use crate::service::{Flavor, Service};
+use crate::service::{Flavor, Protocol, Service};
 use models::action::{Action, CrudKind, Resource, Verb};
 use serde_json::{Map, Value};
 
+/// A fail-closed sentinel verb for RPC requests whose operation cannot be extracted. No
+/// sane policy lists it, so it falls through to default-deny.
+const UNPARSED: &str = "__unparsed__";
+
 /// Normalize a request to `service` into an `Action`.
 pub fn normalize(service: &Service, req: &ProxyRequest) -> Action {
-    let verb = verb_for(&req.method);
     let path = req.path.trim_start_matches('/');
     let resource = match service.flavor {
         Flavor::Github => github_resource(path),
         Flavor::Generic => generic_resource(path),
     };
-    let fields = merge_fields(&req.query, &req.body);
+    let verb = verb_for_protocol(service.extract.protocol, req);
+    let mut fields = merge_fields(&req.query, &req.body);
+    if let Some(template) = &service.extract.path_template {
+        capture_path_template(template, path, &mut fields);
+    }
     Action::of(service.name.clone(), verb, resource).with_fields(fields)
+}
+
+/// The verb for a request under a wire protocol: a CRUD verb from the method (REST), or a
+/// named action read from the body/header (AWS RPC).
+fn verb_for_protocol(protocol: Protocol, req: &ProxyRequest) -> Verb {
+    match protocol {
+        Protocol::Rest => verb_for(&req.method),
+        Protocol::AwsQuery => aws_query_action(req),
+        Protocol::AwsJson => aws_json_action(req),
+    }
 }
 
 /// Map an HTTP method to a coarse CRUD [`Verb`]. Unknown/odd methods map to `Read`, the
@@ -31,6 +50,60 @@ fn verb_for(method: &http::Method) -> Verb {
         _ => CrudKind::Read,
     };
     Verb::crud(kind)
+}
+
+/// AWS query protocol: operation = `Action=<Op>` in the form body (or query string).
+/// Fail-closed to [`UNPARSED`] when absent.
+fn aws_query_action(req: &ProxyRequest) -> Verb {
+    let find_action = |pairs: Vec<(String, String)>| {
+        pairs
+            .into_iter()
+            .find(|(k, _)| k == "Action")
+            .map(|(_, v)| v)
+    };
+    let from_body = std::str::from_utf8(&req.body)
+        .ok()
+        .and_then(|b| find_action(parse_query(b)));
+    let op = from_body.or_else(|| find_action(parse_query(&req.query)));
+    match op {
+        Some(op) if !op.is_empty() => Verb::action(op),
+        _ => Verb::action(UNPARSED),
+    }
+}
+
+/// AWS JSON protocol: operation = the suffix of the `X-Amz-Target: <svc>.<Op>` header.
+/// Fail-closed to [`UNPARSED`] when absent.
+fn aws_json_action(req: &ProxyRequest) -> Verb {
+    match req
+        .headers
+        .get("x-amz-target")
+        .and_then(|v| v.to_str().ok())
+        .filter(|t| !t.is_empty())
+    {
+        Some(target) => Verb::action(target.rsplit('.').next().unwrap_or(target)),
+        None => Verb::action(UNPARSED),
+    }
+}
+
+/// Capture named segments from a path template (e.g. `/{bucket}/{key}`) into `fields`.
+/// A trailing `{name+}` captures the remaining segments joined by `/`.
+fn capture_path_template(template: &str, path: &str, fields: &mut Value) {
+    let Value::Object(map) = fields else { return };
+    let t: Vec<&str> = template.trim_start_matches('/').split('/').collect();
+    let p: Vec<&str> = path.split('/').collect();
+    for (i, seg) in t.iter().enumerate() {
+        let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+            continue;
+        };
+        if let Some(rest_name) = name.strip_suffix('+') {
+            let rest = p.get(i..).map(|s| s.join("/")).unwrap_or_default();
+            if !rest.is_empty() {
+                map.insert(rest_name.to_string(), Value::String(rest));
+            }
+        } else if let Some(v) = p.get(i) {
+            map.insert(name.to_string(), Value::String((*v).to_string()));
+        }
+    }
 }
 
 /// Generic resource: the full path as the canonical id, with the first path segment as
@@ -70,9 +143,11 @@ fn github_collection_kind(collection: &str) -> &'static str {
     }
 }
 
-/// Merge query-string params and a JSON body into one flat `fields` object for
-/// conditional rules. Body keys win over query keys. A non-JSON or non-object body
-/// contributes nothing (its bytes still pass through untouched when forwarded).
+/// Merge query-string params and the request body into one flat `fields` object for
+/// conditional rules. Body keys win over query keys. A JSON object body contributes its
+/// keys; otherwise a form-encoded body (one containing `=`, e.g. AWS query / HTML forms)
+/// contributes its pairs. Any other body contributes nothing (its bytes still pass
+/// through untouched when forwarded).
 fn merge_fields(query: &str, body: &[u8]) -> Value {
     let mut map = Map::new();
     for (k, v) in parse_query(query) {
@@ -81,6 +156,14 @@ fn merge_fields(query: &str, body: &[u8]) -> Value {
     if let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(body) {
         for (k, v) in obj {
             map.insert(k, v);
+        }
+    } else if let Ok(text) = std::str::from_utf8(body) {
+        // Form-encoded fallback — only when it actually looks like `k=v` pairs, so a
+        // plain non-form body (e.g. "not json") contributes nothing.
+        if text.contains('=') {
+            for (k, v) in parse_query(text) {
+                map.insert(k, Value::String(v));
+            }
         }
     }
     Value::Object(map)
@@ -117,6 +200,7 @@ mod tests {
             flavor,
             outbound: crate::service::Outbound::Passthrough,
             address: String::new(),
+            extract: crate::service::Extract::default(),
         }
     }
 
@@ -198,5 +282,60 @@ mod tests {
             &req(http::Method::POST, "/x", "", "not json"),
         );
         assert_eq!(a.fields, serde_json::json!({}));
+    }
+
+    #[test]
+    fn aws_query_protocol_sets_named_verb_and_form_fields() {
+        let mut svc = service("aws", Flavor::Generic);
+        svc.extract.protocol = Protocol::AwsQuery;
+        let a = normalize(
+            &svc,
+            &req(
+                http::Method::POST,
+                "/",
+                "",
+                "Action=DescribeInstances&InstanceId=i-123",
+            ),
+        );
+        assert_eq!(a.verb, Verb::action("DescribeInstances"));
+        assert_eq!(
+            a.fields,
+            serde_json::json!({ "Action": "DescribeInstances", "InstanceId": "i-123" })
+        );
+    }
+
+    #[test]
+    fn aws_query_missing_action_fails_closed() {
+        let mut svc = service("aws", Flavor::Generic);
+        svc.extract.protocol = Protocol::AwsQuery;
+        let a = normalize(
+            &svc,
+            &req(http::Method::POST, "/", "", "Version=2016-11-15"),
+        );
+        assert_eq!(a.verb, Verb::action("__unparsed__"));
+    }
+
+    #[test]
+    fn aws_json_protocol_reads_target_header() {
+        let mut svc = service("ddb", Flavor::Generic);
+        svc.extract.protocol = Protocol::AwsJson;
+        let mut r = req(http::Method::POST, "/", "", r#"{"TableName":"dev"}"#);
+        r.headers
+            .insert("x-amz-target", "DynamoDB_20120810.PutItem".parse().unwrap());
+        let a = normalize(&svc, &r);
+        assert_eq!(a.verb, Verb::action("PutItem"));
+        assert_eq!(a.fields, serde_json::json!({ "TableName": "dev" }));
+    }
+
+    #[test]
+    fn path_template_captures_named_segments() {
+        let mut svc = service("s3", Flavor::Generic);
+        svc.extract.path_template = Some("/{bucket}/{key+}".into());
+        let a = normalize(
+            &svc,
+            &req(http::Method::PUT, "/my-data/reports/q1.csv", "", ""),
+        );
+        assert_eq!(a.fields["bucket"], serde_json::json!("my-data"));
+        assert_eq!(a.fields["key"], serde_json::json!("reports/q1.csv"));
     }
 }

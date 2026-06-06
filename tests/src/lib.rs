@@ -7,7 +7,7 @@
 use axum::Router;
 use axum::extract::State;
 use control::{ControlPlane, InMemoryAudit, InMemoryCredentials, Secret};
-use gateway::{Flavor, Gateway, Outbound, ServerState, Service, ServiceRouter};
+use gateway::{Extract, Flavor, Gateway, Outbound, ServerState, Service, ServiceRouter};
 use models::policy::Policy;
 use std::sync::{Arc, Mutex};
 
@@ -137,6 +137,7 @@ pub async fn start_halter(upstream_base: &str) -> Harness {
             credential: "github-app".to_string(),
         },
         address: String::new(),
+        extract: Extract::default(),
     }])
     .await
 }

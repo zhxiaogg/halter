@@ -414,7 +414,7 @@ fn is_dropped_header(name: &http::HeaderName, source: AuthSource) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::service::{Flavor, Service, ServiceRouter};
+    use crate::service::{Extract, Flavor, Service, ServiceRouter};
     use control::{InMemoryAudit, Secret};
     use models::policy::{Effect, Match, Policy, Rule};
 
@@ -443,6 +443,7 @@ mod tests {
                 credential: "github-app".into(),
             },
             address: String::new(),
+            extract: Extract::default(),
         }])
     }
 
@@ -455,6 +456,7 @@ mod tests {
             flavor: Flavor::Generic,
             outbound: Outbound::Passthrough,
             address: String::new(),
+            extract: Extract::default(),
         }])
     }
 
@@ -470,6 +472,7 @@ mod tests {
                 credential: "keyed-key".into(),
             },
             address: String::new(),
+            extract: Extract::default(),
         }])
     }
 
@@ -728,6 +731,7 @@ mod tests {
                     credential: "github-app".into(),
                 },
                 address: "https://gh.halter.local".into(),
+                extract: Extract::default(),
             },
             Service {
                 name: "openai".into(),
@@ -736,6 +740,7 @@ mod tests {
                 flavor: Flavor::Generic,
                 outbound: Outbound::Passthrough,
                 address: String::new(),
+                extract: Extract::default(),
             },
         ])
     }

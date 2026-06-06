@@ -10,7 +10,7 @@ mod config;
 use clap::{Parser, Subcommand};
 use config::{Config, OutboundConfig};
 use control::{ControlPlane, InMemoryCredentials, Secret, TracingAudit};
-use gateway::{Flavor, Gateway, Outbound, Service, ServiceRouter};
+use gateway::{Extract, Flavor, Gateway, Outbound, Protocol, Service, ServiceRouter};
 use models::control::{MintRequest, MintResponse};
 use models::policy::Policy;
 use std::sync::Arc;
@@ -96,6 +96,10 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 },
             },
             address: s.consumer_address.clone().unwrap_or_default(),
+            extract: Extract {
+                protocol: Protocol::parse(s.protocol.as_deref()),
+                path_template: s.path_template.clone(),
+            },
         })
         .collect();
     tracing::info!(

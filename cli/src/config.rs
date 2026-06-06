@@ -37,6 +37,12 @@ pub struct ServiceConfig {
     /// halter (surfaced in the provision doc). Optional.
     #[serde(default)]
     pub consumer_address: Option<String>,
+    /// Wire protocol for extraction: "rest" (default), "aws-query", or "aws-json".
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// Optional path template capturing named segments into fields, e.g. `/{bucket}/{key+}`.
+    #[serde(default)]
+    pub path_template: Option<String>,
     /// What halter does with upstream auth on allow: `"passthrough"` (default) forwards
     /// the consumer's own credential; `{ "bearer": "<cred-id>" }` injects it as a Bearer
     /// token; `{ "header": { "name": "X-API-Key", "credential": "<cred-id>" } }` injects

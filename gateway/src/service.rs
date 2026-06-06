@@ -12,6 +12,43 @@ pub enum Flavor {
     Generic,
 }
 
+/// The wire protocol that decides *where the operation lives* in a request — the only
+/// real branch in extraction. `Rest` (the default) reads the HTTP method + path; the AWS
+/// RPC protocols read the operation from the body/header (the path is constant).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Protocol {
+    /// Operation = HTTP method + URL path (RESTful: GitHub, k8s, S3, most APIs).
+    #[default]
+    Rest,
+    /// AWS query protocol: `Action=<Op>` in a form-encoded body (EC2, IAM, …).
+    AwsQuery,
+    /// AWS JSON protocol: `X-Amz-Target: <svc>.<Op>` header (DynamoDB, …).
+    AwsJson,
+}
+
+impl Protocol {
+    /// Parse a protocol name; unknown/absent values default to [`Protocol::Rest`].
+    pub fn parse(name: Option<&str>) -> Self {
+        match name {
+            Some(n) if n.eq_ignore_ascii_case("aws-query") => Protocol::AwsQuery,
+            Some(n) if n.eq_ignore_ascii_case("aws-json") => Protocol::AwsJson,
+            _ => Protocol::Rest,
+        }
+    }
+}
+
+/// Per-service normalization config — how a raw request becomes an `Action`. Grouped so
+/// extraction knobs can grow without touching every `Service` site. Defaults to plain
+/// RESTful method+path extraction (Tier 0).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Extract {
+    /// The wire protocol (operation location).
+    pub protocol: Protocol,
+    /// Optional path template capturing named segments into `fields`, e.g.
+    /// `/{bucket}/{key}`. `None` = no capture (Tier 0 path glob).
+    pub path_template: Option<String>,
+}
+
 impl Flavor {
     /// Parse a flavor name; unknown/absent values default to [`Flavor::Generic`].
     pub fn parse(name: Option<&str>) -> Self {
@@ -75,6 +112,8 @@ pub struct Service {
     /// Consumer-facing address the agent points its tool at to reach this service
     /// through halter (the provision doc surfaces this). Empty if not configured.
     pub address: String,
+    /// How requests are normalized into an `Action` (protocol + field extraction).
+    pub extract: Extract,
 }
 
 /// Routes an inbound request to a service by its `Host`. First match wins, so put more
@@ -137,6 +176,7 @@ mod tests {
             flavor: Flavor::Generic,
             outbound: Outbound::Passthrough,
             address: String::new(),
+            extract: Extract::default(),
         }
     }
 
