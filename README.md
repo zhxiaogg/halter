@@ -60,22 +60,25 @@ only a normalized `Action`, so a future K8s or Envoy adapter reuses it unchanged
 
 ## Policy model
 
-Each agent has a **standing policy** (attached to its identity). Rules are evaluated
-**first-match-wins**, **default-deny**:
+A **token is minted from a policy document** (there is no agent identity). Rules are
+evaluated **first-match-wins**, **default-deny**. `verb` is an open tagged union — a CRUD
+arm for RESTful services, a named-action arm (`{"type":"Action","value":{"id":"…"}}`) for
+RPC services:
 
 ```json
 { "effect": "Allow",
   "matches": {
-    "verbs": ["Create"],
+    "verbs": [ { "type": "Crud", "value": { "kind": "Create" } } ],
     "resources": ["repos/*/*/pulls"],
     "conditions": [ { "type": "Equals", "value": { "field": "base", "value": "develop" } } ]
-  },
-  "grantCredentials": ["github-app"] }
+  } }
 ```
 
 That rule means: *may open pull requests in any repo, but only against the `develop`
-base branch* — finer-grained than GitHub's native permissions. On allow, the
-`github-app` credential is injected upstream.
+base branch* — finer-grained than GitHub's native permissions. **Credentials are not
+named in the policy**: each service instance owns its credential and outbound stance
+(`passthrough` to forward the consumer's own credential, or `{ "inject": "<id>" }` to swap
+in the real one).
 
 ## Quickstart
 
@@ -84,10 +87,11 @@ make build
 # edit examples/config.json: set a real credential and your agents' policies
 make run                      # serves proxy on :9090, admin API on :9091
 
-# mint a launch token for an agent (the orchestrator does this at launch)
-cargo run -p cli --bin halter -- mint --admin-url http://127.0.0.1:9091 --agent reviewer-bot --ttl 3600
+# mint a launch token from a policy document (the orchestrator does this at launch)
+cargo run -p cli --bin halter -- mint --admin-url http://127.0.0.1:9091 \
+  --policy examples/policy.reviewer-bot.json --ttl 3600
 
-# the agent then points gh/git at the proxy and presents the token
+# the consumer then points gh/git at the proxy and presents the token
 GH_HOST=127.0.0.1:9090 GITHUB_TOKEN=<minted-token> gh ...
 ```
 
