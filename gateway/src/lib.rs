@@ -13,4 +13,4 @@ pub mod service;
 
 pub use core::{ForwardPlan, Gateway, Outcome, ProxyRequest, Rejection};
 pub use server::{ServerState, admin_router, proxy_router, serve};
-pub use service::{Extract, Flavor, Outbound, Protocol, Service, ServiceRouter};
+pub use service::{Catalog, Extract, Flavor, Outbound, Protocol, Service, ServiceRouter};

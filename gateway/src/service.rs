@@ -49,6 +49,34 @@ pub struct Extract {
     pub path_template: Option<String>,
 }
 
+/// A per-target action vocabulary used to validate policies at mint time. Empty = no
+/// catalog (raw / unvalidated, structural checks only). Populated from a static config
+/// list today; an OpenAPI / k8s-discovery / AWS-SAR ingester produces the same set, so
+/// validation never changes when a richer source is added.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Catalog {
+    actions: std::collections::BTreeSet<String>,
+}
+
+impl Catalog {
+    /// Build a catalog from a set of known named-action ids (e.g. "ec2:DescribeInstances").
+    pub fn of(actions: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            actions: actions.into_iter().collect(),
+        }
+    }
+
+    /// Whether this catalog is absent (no semantic validation — raw).
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty()
+    }
+
+    /// Whether `action` is a known catalog action.
+    pub fn knows(&self, action: &str) -> bool {
+        self.actions.contains(action)
+    }
+}
+
 impl Flavor {
     /// Parse a flavor name; unknown/absent values default to [`Flavor::Generic`].
     pub fn parse(name: Option<&str>) -> Self {

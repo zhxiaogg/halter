@@ -47,6 +47,10 @@ pub struct ServiceConfig {
     /// Optional path template capturing named segments into fields, e.g. `/{bucket}/{key+}`.
     #[serde(default)]
     pub path_template: Option<String>,
+    /// Optional action catalog: known named-action ids (e.g. "ec2:DescribeInstances") used
+    /// to validate policies at mint time. Empty = unvalidated (raw).
+    #[serde(default)]
+    pub catalog: Vec<String>,
     /// What halter does with upstream auth on allow: `"passthrough"` (default) forwards
     /// the consumer's own credential; `{ "bearer": "<cred-id>" }` injects it as a Bearer
     /// token; `{ "header": { "name": "X-API-Key", "credential": "<cred-id>" } }` injects

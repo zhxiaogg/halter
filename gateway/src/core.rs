@@ -9,11 +9,12 @@
 //! deterministically testable.
 
 use crate::normalize;
-use crate::service::{Outbound, Service, ServiceRouter};
+use crate::service::{Catalog, Outbound, Service, ServiceRouter};
 use control::{ControlPlane, now_ms};
 use models::action::Action;
 use models::audit::{AuditEvent, Decision};
 use models::verdict::{DenyReason, Verdict};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A normalized inbound request, independent of any HTTP library.
@@ -59,6 +60,9 @@ pub struct Gateway {
     control: Arc<ControlPlane>,
     router: ServiceRouter,
     clock: Clock,
+    /// Per-target action catalogs used to validate policies at mint time. A target with
+    /// no entry (or an empty catalog) is unvalidated (raw).
+    catalogs: HashMap<String, Catalog>,
 }
 
 impl Gateway {
@@ -69,6 +73,7 @@ impl Gateway {
             control,
             router,
             clock: Arc::new(now_ms),
+            catalogs: HashMap::new(),
         }
     }
 
@@ -78,7 +83,15 @@ impl Gateway {
             control,
             router,
             clock,
+            catalogs: HashMap::new(),
         }
+    }
+
+    /// Attach per-target action catalogs (for mint-time policy validation). Builder.
+    #[must_use]
+    pub fn with_catalogs(mut self, catalogs: HashMap<String, Catalog>) -> Self {
+        self.catalogs = catalogs;
+        self
     }
 
     /// Mint a launch token bound to `policy`. This is the control-plane verb the
@@ -113,7 +126,42 @@ impl Gateway {
                 .ok_or("unknown tenant credential")?;
             validate_tenant_policy(&policy, &owned)?;
         }
+        self.validate_catalog(&policy)?;
         Ok(self.mint(policy, ttl_seconds))
+    }
+
+    /// Validate a policy's named-action verbs against the catalog of each explicit target
+    /// it scopes to. A target with no catalog is unvalidated (raw); a known action passes;
+    /// an unknown action **rejects the mint** (fail closed) — catching typos and stale
+    /// assumptions before a token exists. CRUD verbs are always valid (Tier 0).
+    fn validate_catalog(&self, policy: &models::policy::Policy) -> Result<(), String> {
+        use models::action::Verb;
+        use models::policy::Effect;
+        for rule in &policy.rules {
+            if rule.effect != Effect::Allow {
+                continue;
+            }
+            for target in &rule.matches.targets {
+                let Some(catalog) = self.catalogs.get(target) else {
+                    continue;
+                };
+                if catalog.is_empty() {
+                    continue;
+                }
+                for verb in &rule.matches.verbs {
+                    let Verb::Action(named) = verb else {
+                        continue;
+                    };
+                    if !catalog.knows(&named.id) {
+                        return Err(format!(
+                            "action '{}' is not in the catalog for target '{target}'",
+                            named.id
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Project a [`ProvisionDoc`] for the consumer holding `token`: the token's bound
@@ -822,6 +870,61 @@ mod tests {
         );
         // An unknown token yields no doc.
         assert!(gw.provision("bogus").is_none());
+    }
+
+    #[test]
+    fn catalog_validates_named_actions_at_mint() {
+        use crate::service::Catalog;
+        let (control, _a, _) = test_control();
+        let mut catalogs = std::collections::HashMap::new();
+        catalogs.insert(
+            "github".to_string(),
+            Catalog::of(["repo:read".to_string(), "repo:write".to_string()]),
+        );
+        let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000))
+            .with_catalogs(catalogs);
+
+        // A named action in the catalog mints.
+        let ok = Policy {
+            rules: vec![Rule {
+                effect: Effect::Allow,
+                matches: Match {
+                    targets: vec!["github".into()],
+                    verbs: vec![models::action::Verb::action("repo:read")],
+                    resources: vec![],
+                    conditions: vec![],
+                },
+            }],
+        };
+        assert!(gw.mint_checked(ok, 60, None).is_ok());
+
+        // An unknown named action is rejected (fail closed).
+        let bad = Policy {
+            rules: vec![Rule {
+                effect: Effect::Allow,
+                matches: Match {
+                    targets: vec!["github".into()],
+                    verbs: vec![models::action::Verb::action("repo:delete-universe")],
+                    resources: vec![],
+                    conditions: vec![],
+                },
+            }],
+        };
+        assert!(gw.mint_checked(bad, 60, None).is_err());
+
+        // A target with no catalog (openai) is unvalidated — any named action passes.
+        let raw = Policy {
+            rules: vec![Rule {
+                effect: Effect::Allow,
+                matches: Match {
+                    targets: vec!["openai".into()],
+                    verbs: vec![models::action::Verb::action("anything:goes")],
+                    resources: vec![],
+                    conditions: vec![],
+                },
+            }],
+        };
+        assert!(gw.mint_checked(raw, 60, None).is_ok());
     }
 
     #[test]

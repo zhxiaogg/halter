@@ -10,9 +10,10 @@ mod config;
 use clap::{Parser, Subcommand};
 use config::{Config, OutboundConfig};
 use control::{ControlPlane, InMemoryCredentials, Secret, TracingAudit};
-use gateway::{Extract, Flavor, Gateway, Outbound, Protocol, Service, ServiceRouter};
+use gateway::{Catalog, Extract, Flavor, Gateway, Outbound, Protocol, Service, ServiceRouter};
 use models::control::{MintRequest, MintResponse};
 use models::policy::Policy;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -111,7 +112,13 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         "loaded config"
     );
 
-    let gateway = Gateway::new(control, ServiceRouter::new(services));
+    let mut catalogs: HashMap<String, Catalog> = HashMap::new();
+    for s in &cfg.services {
+        if !s.catalog.is_empty() {
+            catalogs.insert(s.name.clone(), Catalog::of(s.catalog.iter().cloned()));
+        }
+    }
+    let gateway = Gateway::new(control, ServiceRouter::new(services)).with_catalogs(catalogs);
 
     let proxy_addr = cfg.proxy_addr.parse()?;
     let admin_addr = cfg.admin_addr.parse()?;
