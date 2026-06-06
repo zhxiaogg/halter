@@ -7,7 +7,7 @@
       "host": "api.github.com",
       "upstream_base": "https://api.github.com",
       "flavor": "github",
-      "outbound": { "inject": "github-app" }
+      "outbound": { "bearer": "github-app" }
     },
     {
       "name": "openai",

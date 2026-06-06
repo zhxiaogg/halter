@@ -133,7 +133,7 @@ pub async fn start_halter(upstream_base: &str) -> Harness {
         host: "*".to_string(),
         upstream_base: upstream_base.to_string(),
         flavor: Flavor::Github,
-        outbound: Outbound::Inject {
+        outbound: Outbound::Bearer {
             credential: "github-app".to_string(),
         },
     }])

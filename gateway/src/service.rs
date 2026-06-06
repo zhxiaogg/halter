@@ -22,15 +22,32 @@ impl Flavor {
     }
 }
 
-/// What halter does with upstream auth when a request is allowed. This is the **hybrid**
-/// stance: filter-only by default (`Passthrough`), credential-hiding where it matters
-/// (`Inject`). The credential is a property of the service instance, never named in policy.
+/// What halter does with upstream auth when a request is allowed — a closed mechanism
+/// library, selected per service instance. This is the **hybrid** stance: filter-only by
+/// default (`Passthrough`), credential-hiding via one of the inject mechanisms. The
+/// credential is a property of the service instance, never named in policy. (SigV4 — a
+/// request *transform* rather than a header set — is added as its own arm later.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outbound {
     /// Forward the consumer's own credential unchanged (filter-only).
     Passthrough,
-    /// Swap in the target's real credential, resolved from the vault by this logical id.
-    Inject { credential: String },
+    /// Inject the vault credential as `Authorization: Bearer <secret>`.
+    Bearer { credential: String },
+    /// Inject the vault credential as a custom header `<name>: <secret>` (e.g.
+    /// `X-API-Key`).
+    Header { name: String, credential: String },
+}
+
+impl Outbound {
+    /// The vault credential id this stance injects, if any (`None` for passthrough).
+    pub fn credential_id(&self) -> Option<&str> {
+        match self {
+            Outbound::Passthrough => None,
+            Outbound::Bearer { credential } | Outbound::Header { credential, .. } => {
+                Some(credential)
+            }
+        }
+    }
 }
 
 /// One configured upstream service instance.

@@ -87,8 +87,12 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             flavor: Flavor::parse(s.flavor.as_deref()),
             outbound: match &s.outbound {
                 OutboundConfig::Passthrough => Outbound::Passthrough,
-                OutboundConfig::Inject(id) => Outbound::Inject {
+                OutboundConfig::Bearer(id) => Outbound::Bearer {
                     credential: id.clone(),
+                },
+                OutboundConfig::Header { name, credential } => Outbound::Header {
+                    name: name.clone(),
+                    credential: credential.clone(),
                 },
             },
         })

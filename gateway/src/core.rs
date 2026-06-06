@@ -1,12 +1,12 @@
 //! The gateway core: the transport-agnostic decision + enforcement path.
 //!
 //! [`Gateway::handle`] takes a normalized [`ProxyRequest`], authenticates the halter
-//! token, resolves the agent's policy, normalizes the request into an `Action`, calls
+//! token and resolves its bound policy, normalizes the request into an `Action`, calls
 //! the pure [`policy::decide`], records an audit event, and returns an [`Outcome`] —
-//! either a [`ForwardPlan`] (with the real credential injected and the agent's token
-//! stripped) or a [`Rejection`]. It performs no network I/O itself; the server module
-//! executes the forward. Keeping this layer free of HTTP plumbing makes the whole
-//! decision path deterministically testable.
+//! either a [`ForwardPlan`] (with the matched service's outbound stance applied) or a
+//! [`Rejection`]. It performs no network I/O itself; the server module executes the
+//! forward. Keeping this layer free of HTTP plumbing makes the whole decision path
+//! deterministically testable.
 
 use crate::normalize;
 use crate::service::{Outbound, Service, ServiceRouter};
@@ -141,9 +141,9 @@ impl Gateway {
 
     /// Build the upstream forward plan according to the matched service's outbound
     /// stance. `Passthrough` forwards the consumer's own credential (preserved by
-    /// `sanitize_headers` when the halter token arrived via `X-Halter-Token`); `Inject`
-    /// swaps in the target's real credential from the vault. A missing credential fails
-    /// closed.
+    /// `sanitize_headers` when the halter token arrived via `X-Halter-Token`); `Bearer`
+    /// and `Header` swap in the target's real credential from the vault. A missing
+    /// credential fails closed.
     fn plan_forward(
         &self,
         service: &Service,
@@ -156,34 +156,29 @@ impl Gateway {
 
         let detail = match &service.outbound {
             Outbound::Passthrough => "allowed (passthrough)".to_string(),
-            Outbound::Inject { credential } => {
-                let Some(secret) = self.control.credentials.resolve(credential) else {
-                    self.audit(
-                        action,
-                        Decision::Deny,
-                        &format!("credential '{credential}' not configured"),
-                        now,
-                    );
+            Outbound::Bearer { credential } => {
+                let value = match self.resolve_header_value(action, credential, "Bearer ", now) {
+                    Ok(v) => v,
+                    Err(outcome) => return *outcome,
+                };
+                headers.insert(http::header::AUTHORIZATION, value);
+                format!("allowed; injected bearer [{credential}]")
+            }
+            Outbound::Header { name, credential } => {
+                let Ok(header_name) = http::HeaderName::from_bytes(name.as_bytes()) else {
+                    self.audit(action, Decision::Deny, "invalid header name", now);
                     return reject(
                         http::StatusCode::BAD_GATEWAY,
                         DenyReason::NotAllowed,
-                        "required credential is not configured",
+                        "configured header name is invalid",
                     );
                 };
-                match http::HeaderValue::from_str(&format!("Bearer {}", secret.expose())) {
-                    Ok(value) => {
-                        headers.insert(http::header::AUTHORIZATION, value);
-                    }
-                    Err(_) => {
-                        self.audit(action, Decision::Deny, "credential not header-safe", now);
-                        return reject(
-                            http::StatusCode::BAD_GATEWAY,
-                            DenyReason::NotAllowed,
-                            "credential is not header-safe",
-                        );
-                    }
-                }
-                format!("allowed; injected [{credential}]")
+                let value = match self.resolve_header_value(action, credential, "", now) {
+                    Ok(v) => v,
+                    Err(outcome) => return *outcome,
+                };
+                headers.insert(header_name, value);
+                format!("allowed; injected header {name} [{credential}]")
             }
         };
         self.audit(action, Decision::Allow, &detail, now);
@@ -193,6 +188,39 @@ impl Gateway {
             method: req.method,
             headers,
             body: req.body,
+        })
+    }
+
+    /// Resolve a vault credential into a header value `<prefix><secret>`, or a boxed
+    /// `Err(Outcome)` that fails closed (audited) when the credential is missing or not
+    /// header-safe. (Boxed because `Outcome` is large.)
+    fn resolve_header_value(
+        &self,
+        action: &Action,
+        credential: &str,
+        prefix: &str,
+        now: u64,
+    ) -> Result<http::HeaderValue, Box<Outcome>> {
+        let Some(secret) = self.control.credentials.resolve(credential) else {
+            self.audit(
+                action,
+                Decision::Deny,
+                &format!("credential '{credential}' not configured"),
+                now,
+            );
+            return Err(Box::new(reject(
+                http::StatusCode::BAD_GATEWAY,
+                DenyReason::NotAllowed,
+                "required credential is not configured",
+            )));
+        };
+        http::HeaderValue::from_str(&format!("{prefix}{}", secret.expose())).map_err(|_| {
+            self.audit(action, Decision::Deny, "credential not header-safe", now);
+            Box::new(reject(
+                http::StatusCode::BAD_GATEWAY,
+                DenyReason::NotAllowed,
+                "credential is not header-safe",
+            ))
         })
     }
 
@@ -351,7 +379,7 @@ mod tests {
             host: "*".into(),
             upstream_base: "https://api.github.com".into(),
             flavor: Flavor::Github,
-            outbound: Outbound::Inject {
+            outbound: Outbound::Bearer {
                 credential: "github-app".into(),
             },
         }])
@@ -365,6 +393,20 @@ mod tests {
             upstream_base: "https://up.example".into(),
             flavor: Flavor::Generic,
             outbound: Outbound::Passthrough,
+        }])
+    }
+
+    /// A catch-all generic service that injects a credential as `X-API-Key`.
+    fn router_header() -> ServiceRouter {
+        ServiceRouter::new(vec![Service {
+            name: "keyed".into(),
+            host: "*".into(),
+            upstream_base: "https://api.keyed.com".into(),
+            flavor: Flavor::Generic,
+            outbound: Outbound::Header {
+                name: "X-API-Key".into(),
+                credential: "keyed-key".into(),
+            },
         }])
     }
 
@@ -551,6 +593,25 @@ mod tests {
                         .and_then(|v| v.to_str().ok()),
                     Some("Bearer real-secret-token")
                 );
+            }
+            Outcome::Reject(_) => panic!("expected forward"),
+        }
+    }
+
+    #[test]
+    fn header_mechanism_injects_custom_header() {
+        let (control, _a, creds) = test_control();
+        creds.insert("keyed-key", Secret::new("sk-keyed"));
+        let gw = Gateway::with_clock(control, router_header(), fixed_clock(1_000));
+        let minted = gw.mint(allow_all(), 60);
+        match gw.handle(get(bearer(&minted.token), "/v1/x")) {
+            Outcome::Forward(plan) => {
+                assert_eq!(
+                    plan.headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+                    Some("sk-keyed")
+                );
+                // No Bearer Authorization for a header-keyed service.
+                assert!(plan.headers.get(http::header::AUTHORIZATION).is_none());
             }
             Outcome::Reject(_) => panic!("expected forward"),
         }

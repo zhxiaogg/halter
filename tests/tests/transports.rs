@@ -23,7 +23,7 @@ async fn generic_service_is_proxied_with_its_credential() {
         host: "*".into(),
         upstream_base: upstream.base_url.clone(),
         flavor: Flavor::Generic,
-        outbound: Outbound::Inject {
+        outbound: Outbound::Bearer {
             credential: "openai-key".into(),
         },
     }])
@@ -56,7 +56,7 @@ async fn sse_stream_is_relayed() {
         host: "*".into(),
         upstream_base: upstream.base_url.clone(),
         flavor: Flavor::Generic,
-        outbound: Outbound::Inject {
+        outbound: Outbound::Bearer {
             credential: "svc-key".into(),
         },
     }])
@@ -93,7 +93,7 @@ async fn unrouted_host_is_denied() {
         host: "api.github.com".into(),
         upstream_base: upstream.base_url.clone(),
         flavor: Flavor::Github,
-        outbound: Outbound::Inject {
+        outbound: Outbound::Bearer {
             credential: "github-app".into(),
         },
     }])

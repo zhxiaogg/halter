@@ -34,8 +34,9 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub flavor: Option<String>,
     /// What halter does with upstream auth on allow: `"passthrough"` (default) forwards
-    /// the consumer's own credential; `{ "inject": "<cred-id>" }` swaps in the target's
-    /// real credential.
+    /// the consumer's own credential; `{ "bearer": "<cred-id>" }` injects it as a Bearer
+    /// token; `{ "header": { "name": "X-API-Key", "credential": "<cred-id>" } }` injects
+    /// it as a custom header.
     #[serde(default)]
     pub outbound: OutboundConfig,
 }
@@ -47,8 +48,10 @@ pub enum OutboundConfig {
     /// Forward the consumer's own credential unchanged (filter-only).
     #[default]
     Passthrough,
-    /// Swap in the target's real credential, named by its vault id.
-    Inject(String),
+    /// Inject the named vault credential as `Authorization: Bearer <secret>`.
+    Bearer(String),
+    /// Inject the named vault credential as a custom header.
+    Header { name: String, credential: String },
 }
 
 impl Config {
@@ -72,22 +75,29 @@ mod tests {
             "admin_addr": "127.0.0.1:9091",
             "services": [
                 { "name": "github", "host": "api.github.com", "upstream_base": "https://api.github.com",
-                  "flavor": "github", "outbound": { "inject": "github-app" } },
+                  "flavor": "github", "outbound": { "bearer": "github-app" } },
                 { "name": "openai", "host": "api.openai.com", "upstream_base": "https://api.openai.com",
-                  "flavor": "generic", "outbound": "passthrough" }
+                  "flavor": "generic", "outbound": "passthrough" },
+                { "name": "keyed", "host": "api.keyed.com", "upstream_base": "https://api.keyed.com",
+                  "outbound": { "header": { "name": "X-API-Key", "credential": "keyed-key" } } }
             ],
             "credentials": { "github-app": "secret" }
         }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.proxy_addr, "127.0.0.1:9090");
-        assert_eq!(cfg.services.len(), 2);
+        assert_eq!(cfg.services.len(), 3);
         assert!(matches!(
             cfg.services[0].outbound,
-            OutboundConfig::Inject(ref id) if id == "github-app"
+            OutboundConfig::Bearer(ref id) if id == "github-app"
         ));
         assert!(matches!(
             cfg.services[1].outbound,
             OutboundConfig::Passthrough
+        ));
+        assert!(matches!(
+            cfg.services[2].outbound,
+            OutboundConfig::Header { ref name, ref credential }
+                if name == "X-API-Key" && credential == "keyed-key"
         ));
         assert_eq!(
             cfg.credentials.get("github-app").map(String::as_str),
