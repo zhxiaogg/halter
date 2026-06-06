@@ -210,7 +210,7 @@ impl Gateway {
                 address: s.address.clone(),
                 mode: match s.outbound {
                     Outbound::Passthrough => models::provision::ProvisionMode::Passthrough,
-                    Outbound::Bearer { .. } | Outbound::Header { .. } => {
+                    Outbound::Bearer { .. } | Outbound::Header { .. } | Outbound::SigV4 { .. } => {
                         models::provision::ProvisionMode::Inject
                     }
                 },
@@ -304,6 +304,59 @@ impl Gateway {
                 headers.insert(header_name, value);
                 format!("allowed; injected header {name} [{credential}]")
             }
+            Outbound::SigV4 {
+                credential,
+                access_key_id,
+                region,
+                service: aws_service,
+            } => {
+                let Some(secret) = self.control.credentials.resolve(credential) else {
+                    self.audit(
+                        action,
+                        Decision::Deny,
+                        &format!("credential '{credential}' not configured"),
+                        now,
+                    );
+                    return reject(
+                        http::StatusCode::BAD_GATEWAY,
+                        DenyReason::NotAllowed,
+                        "required credential is not configured",
+                    );
+                };
+                let host = host_of(&service.upstream_base);
+                let signed = crate::sigv4::sign(
+                    &crate::sigv4::Creds {
+                        access_key_id,
+                        secret_access_key: secret.expose(),
+                    },
+                    region,
+                    aws_service,
+                    req.method.as_str(),
+                    host,
+                    &req.path,
+                    &req.query,
+                    &req.body,
+                    now,
+                );
+                // The forward URL's host equals `host`, so reqwest sends the same Host we
+                // signed. Set the SigV4 headers (these values are always header-safe).
+                set_header(
+                    &mut headers,
+                    http::header::AUTHORIZATION,
+                    &signed.authorization,
+                );
+                set_header(
+                    &mut headers,
+                    http::HeaderName::from_static("x-amz-date"),
+                    &signed.amz_date,
+                );
+                set_header(
+                    &mut headers,
+                    http::HeaderName::from_static("x-amz-content-sha256"),
+                    &signed.content_sha256,
+                );
+                format!("allowed; sigv4 re-signed [{credential}]")
+            }
         };
         self.audit(action, Decision::Allow, &detail, now);
 
@@ -367,6 +420,20 @@ impl Gateway {
             models::action::Resource::of(host, "host"),
         );
         self.audit(&action, decision, detail, now);
+    }
+}
+
+/// The host portion of an upstream base URL (`https://ec2.us-east-1.amazonaws.com/...` →
+/// `ec2.us-east-1.amazonaws.com`).
+fn host_of(base: &str) -> &str {
+    let no_scheme = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
+    no_scheme.split('/').next().unwrap_or(no_scheme)
+}
+
+/// Insert a header, ignoring values that aren't header-safe (SigV4 values always are).
+fn set_header(headers: &mut http::HeaderMap, name: http::HeaderName, value: &str) {
+    if let Ok(v) = http::HeaderValue::from_str(value) {
+        headers.insert(name, v);
     }
 }
 
@@ -772,6 +839,46 @@ mod tests {
                 );
                 // No Bearer Authorization for a header-keyed service.
                 assert!(plan.headers.get(http::header::AUTHORIZATION).is_none());
+            }
+            Outcome::Reject(_) => panic!("expected forward"),
+        }
+    }
+
+    #[test]
+    fn sigv4_mechanism_signs_outbound_request() {
+        let (control, _a, creds) = test_control();
+        creds.insert("aws-secret", Secret::new("secret-key"));
+        let router = ServiceRouter::new(vec![Service {
+            name: "ec2".into(),
+            host: "*".into(),
+            upstream_base: "https://ec2.us-east-1.amazonaws.com".into(),
+            flavor: Flavor::Generic,
+            outbound: Outbound::SigV4 {
+                credential: "aws-secret".into(),
+                access_key_id: "AKID".into(),
+                region: "us-east-1".into(),
+                service: "ec2".into(),
+            },
+            address: String::new(),
+            extract: Extract::default(),
+        }]);
+        let gw = Gateway::with_clock(control, router, fixed_clock(1_700_000_000_000));
+        let minted = gw.mint(allow_all(), 60);
+        match gw.handle(get(bearer(&minted.token), "/")) {
+            Outcome::Forward(plan) => {
+                let auth = plan
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKID/"));
+                assert!(auth.contains("/us-east-1/ec2/aws4_request"));
+                assert!(auth.contains("Signature="));
+                // The real secret is not present anywhere in the outbound headers.
+                assert!(!auth.contains("secret-key"));
+                assert!(plan.headers.get("x-amz-date").is_some());
+                assert!(plan.headers.get("x-amz-content-sha256").is_some());
             }
             Outcome::Reject(_) => panic!("expected forward"),
         }

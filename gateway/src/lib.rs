@@ -10,6 +10,7 @@ pub mod core;
 pub mod normalize;
 pub mod server;
 pub mod service;
+pub mod sigv4;
 
 pub use core::{ForwardPlan, Gateway, Outcome, ProxyRequest, Rejection};
 pub use server::{ServerState, admin_router, proxy_router, serve};

@@ -98,6 +98,17 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                     name: name.clone(),
                     credential: credential.clone(),
                 },
+                OutboundConfig::Sigv4 {
+                    credential,
+                    access_key_id,
+                    region,
+                    service,
+                } => Outbound::SigV4 {
+                    credential: credential.clone(),
+                    access_key_id: access_key_id.clone(),
+                    region: region.clone(),
+                    service: service.clone(),
+                },
             },
             address: s.consumer_address.clone().unwrap_or_default(),
             extract: Extract {

@@ -16,6 +16,7 @@ http       = { workspace = true }
 axum       = { workspace = true }
 reqwest    = { workspace = true }
 tokio      = { workspace = true }
+ring       = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

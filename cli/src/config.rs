@@ -70,6 +70,14 @@ pub enum OutboundConfig {
     Bearer(String),
     /// Inject the named vault credential as a custom header.
     Header { name: String, credential: String },
+    /// Re-sign the request with AWS SigV4 using the real account credential (the vault
+    /// `credential` is the secret access key).
+    Sigv4 {
+        credential: String,
+        access_key_id: String,
+        region: String,
+        service: String,
+    },
 }
 
 impl Config {

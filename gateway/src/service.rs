@@ -109,16 +109,26 @@ pub enum Outbound {
     /// Inject the vault credential as a custom header `<name>: <secret>` (e.g.
     /// `X-API-Key`).
     Header { name: String, credential: String },
+    /// Re-sign the request with AWS SigV4 using the real account credential — the vault
+    /// `credential` is the secret access key; `access_key_id`, `region`, and `service`
+    /// (the AWS service, e.g. "ec2") parameterize the signature.
+    SigV4 {
+        credential: String,
+        access_key_id: String,
+        region: String,
+        service: String,
+    },
 }
 
 impl Outbound {
-    /// The vault credential id this stance injects, if any (`None` for passthrough).
+    /// The vault credential id this stance injects/signs with, if any (`None` for
+    /// passthrough).
     pub fn credential_id(&self) -> Option<&str> {
         match self {
             Outbound::Passthrough => None,
-            Outbound::Bearer { credential } | Outbound::Header { credential, .. } => {
-                Some(credential)
-            }
+            Outbound::Bearer { credential }
+            | Outbound::Header { credential, .. }
+            | Outbound::SigV4 { credential, .. } => Some(credential),
         }
     }
 }
