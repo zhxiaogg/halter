@@ -14,9 +14,12 @@ use serde_json::{Map, Value};
 /// sane policy lists it, so it falls through to default-deny.
 const UNPARSED: &str = "__unparsed__";
 
-/// Normalize a request to `service` into an `Action`.
-pub fn normalize(service: &Service, req: &ProxyRequest) -> Action {
-    let path = req.path.trim_start_matches('/');
+/// Normalize a request to `service` into an `Action`. `decoded_path` is the canonical,
+/// percent-decoded, dot-resolved path (from [`crate::canonicalize`]) — matching the form a
+/// policy glob is written against — so resource and field extraction see the same path the
+/// engine will decide on.
+pub fn normalize(service: &Service, req: &ProxyRequest, decoded_path: &str) -> Action {
+    let path = decoded_path.trim_start_matches('/');
     let resource = match service.flavor {
         Flavor::Github => github_resource(path),
         Flavor::K8s => k8s_resource(path),
@@ -187,7 +190,8 @@ fn merge_fields(query: &str, body: &[u8]) -> Value {
     Value::Object(map)
 }
 
-/// Minimal `a=b&c=d` parser. Values are taken verbatim (no percent-decoding in v1);
+/// Minimal `a=b&c=d` parser. Keys and values are percent-decoded (and `+` → space) so a
+/// condition like `base == "develop"` can't be evaded by sending `base=deve%6cop`; a
 /// missing `=` yields an empty value.
 fn parse_query(query: &str) -> Vec<(String, String)> {
     if query.is_empty() {
@@ -197,10 +201,15 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
         .split('&')
         .filter(|p| !p.is_empty())
         .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => (k.to_string(), v.to_string()),
-            None => (pair.to_string(), String::new()),
+            Some((k, v)) => (decode_field(k), decode_field(v)),
+            None => (decode_field(pair), String::new()),
         })
         .collect()
+}
+
+/// Percent-decode a query/form token into a lossy string for matching.
+fn decode_field(s: &str) -> String {
+    String::from_utf8_lossy(&crate::sigv4::percent_decode(s)).into_owned()
 }
 
 #[cfg(test)]
@@ -211,15 +220,7 @@ mod tests {
     use http::HeaderMap;
 
     fn service(name: &str, flavor: Flavor) -> Service {
-        Service {
-            name: name.into(),
-            host: "*".into(),
-            upstream_base: "https://upstream.example".into(),
-            flavor,
-            outbound: crate::service::Outbound::Passthrough,
-            address: String::new(),
-            extract: crate::service::Extract::default(),
-        }
+        Service::new(name, "*", "https://upstream.example").with_flavor(flavor)
     }
 
     fn req(method: http::Method, path: &str, query: &str, body: &str) -> ProxyRequest {
@@ -232,6 +233,12 @@ mod tests {
         }
     }
 
+    /// Normalize the way the data plane does: canonicalize the path first, then extract.
+    fn norm(service: &Service, r: &ProxyRequest) -> Action {
+        let canonical = crate::canonicalize::path(&r.path).expect("canonical path");
+        normalize(service, r, &canonical.decoded)
+    }
+
     #[test]
     fn github_flavor_parses_pull_request() {
         let r = req(
@@ -240,7 +247,7 @@ mod tests {
             "",
             r#"{"base":"main","title":"x"}"#,
         );
-        let a = normalize(&service("github", Flavor::Github), &r);
+        let a = norm(&service("github", Flavor::Github), &r);
         assert_eq!(a.target, "github");
         assert_eq!(a.verb, Verb::crud(CrudKind::Create));
         assert_eq!(a.resource.path, "repos/octocat/hello/pulls");
@@ -253,7 +260,7 @@ mod tests {
 
     #[test]
     fn generic_flavor_uses_first_segment_kind() {
-        let a = normalize(
+        let a = norm(
             &service("openai", Flavor::Generic),
             &req(
                 http::Method::POST,
@@ -281,7 +288,7 @@ mod tests {
 
     #[test]
     fn body_overrides_query_fields() {
-        let a = normalize(
+        let a = norm(
             &service("svc", Flavor::Generic),
             &req(
                 http::Method::POST,
@@ -295,7 +302,7 @@ mod tests {
 
     #[test]
     fn non_json_body_is_ignored_for_fields() {
-        let a = normalize(
+        let a = norm(
             &service("svc", Flavor::Generic),
             &req(http::Method::POST, "/x", "", "not json"),
         );
@@ -306,7 +313,7 @@ mod tests {
     fn aws_query_protocol_sets_named_verb_and_form_fields() {
         let mut svc = service("aws", Flavor::Generic);
         svc.extract.protocol = Protocol::AwsQuery;
-        let a = normalize(
+        let a = norm(
             &svc,
             &req(
                 http::Method::POST,
@@ -326,7 +333,7 @@ mod tests {
     fn aws_query_missing_action_fails_closed() {
         let mut svc = service("aws", Flavor::Generic);
         svc.extract.protocol = Protocol::AwsQuery;
-        let a = normalize(
+        let a = norm(
             &svc,
             &req(http::Method::POST, "/", "", "Version=2016-11-15"),
         );
@@ -340,7 +347,7 @@ mod tests {
         let mut r = req(http::Method::POST, "/", "", r#"{"TableName":"dev"}"#);
         r.headers
             .insert("x-amz-target", "DynamoDB_20120810.PutItem".parse().unwrap());
-        let a = normalize(&svc, &r);
+        let a = norm(&svc, &r);
         assert_eq!(a.verb, Verb::action("PutItem"));
         assert_eq!(a.fields, serde_json::json!({ "TableName": "dev" }));
     }
@@ -349,7 +356,7 @@ mod tests {
     fn path_template_captures_named_segments() {
         let mut svc = service("s3", Flavor::Generic);
         svc.extract.path_template = Some("/{bucket}/{key+}".into());
-        let a = normalize(
+        let a = norm(
             &svc,
             &req(http::Method::PUT, "/my-data/reports/q1.csv", "", ""),
         );

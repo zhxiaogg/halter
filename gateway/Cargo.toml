@@ -17,6 +17,12 @@ axum       = { workspace = true }
 reqwest    = { workspace = true }
 tokio      = { workspace = true }
 ring       = { workspace = true }
+tokio-rustls = { workspace = true }
+hyper        = { workspace = true }
+hyper-util   = { workspace = true }
+tower        = { workspace = true }
+base64       = { workspace = true }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

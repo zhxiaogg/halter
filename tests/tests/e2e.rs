@@ -75,6 +75,63 @@ async fn pr_create_gated_by_base_branch() {
     assert_eq!(got[0].path, "/repos/octocat/hello/pulls");
 }
 
+/// Allow reads only under octocat's repos. The canonicalizer must stop a disguised path
+/// from escaping this scope.
+const OCTOCAT_READS: &str = r#"{
+    "rules": [
+        { "effect": "Allow",
+          "matches": {
+              "targets": [], "conditions": [],
+              "verbs": [ { "type": "Crud", "value": { "kind": "Read" } } ],
+              "resources": ["repos/octocat/**"]
+          } }
+    ]
+}"#;
+
+/// User story: a path that *spells* its way out of scope (`..`, encoded dots) is folded to
+/// its canonical form before the policy decision, so it cannot evade a resource glob.
+#[tokio::test]
+async fn path_traversal_cannot_escape_resource_scope() {
+    let upstream = start_mock_upstream().await;
+    let halter = start_halter(&upstream.base_url).await;
+    halter.add_credential("github-app", "real-secret-token");
+    let token = halter.mint_token(&policy_from(OCTOCAT_READS), 3600).await;
+    let client = reqwest::Client::new();
+
+    // In-scope read is allowed and forwarded.
+    let ok = client
+        .get(format!("{}/repos/octocat/hello", halter.proxy_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+
+    // `..` traversal out of octocat's repos → canonicalizes to /repos/evil/secret → denied.
+    let traversal = client
+        .get(format!("{}/repos/octocat/../evil/secret", halter.proxy_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(traversal.status(), 403);
+
+    // Percent-encoded dots are decoded first, so this is the same escape → denied.
+    let encoded = client
+        .get(format!(
+            "{}/repos/octocat/%2e%2e/evil/secret",
+            halter.proxy_url
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(encoded.status(), 403);
+
+    // Only the one in-scope read reached the upstream.
+    assert_eq!(upstream.requests().len(), 1);
+}
+
 /// User story: an unauthenticated or invalid token is rejected before any forwarding.
 #[tokio::test]
 async fn missing_or_invalid_token_is_unauthorized() {
@@ -99,6 +156,62 @@ async fn missing_or_invalid_token_is_unauthorized() {
     assert_eq!(bad_auth.status(), 401);
 
     assert!(!upstream.was_called());
+}
+
+/// User story: a token can be revoked before its TTL, and immediately stops working.
+#[tokio::test]
+async fn revoked_token_is_rejected() {
+    let upstream = start_mock_upstream().await;
+    let halter = start_halter(&upstream.base_url).await;
+    halter.add_credential("github-app", "real-secret-token");
+    let token = halter.mint_token(&policy_from(READ_ONLY), 3600).await;
+    let client = reqwest::Client::new();
+
+    // Works before revocation.
+    let ok = client
+        .get(format!("{}/repos/octocat/hello", halter.proxy_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+
+    // Revoke via the admin API.
+    let revoke = client
+        .post(format!("{}/revoke", halter.admin_url))
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), 200);
+    assert_eq!(
+        revoke.json::<serde_json::Value>().await.unwrap()["revoked"],
+        true
+    );
+
+    // The same token is now unauthorized.
+    let after = client
+        .get(format!("{}/repos/octocat/hello", halter.proxy_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), 401);
+
+    // Revoking an unknown token reports `revoked: false`.
+    let again = client
+        .post(format!("{}/revoke", halter.admin_url))
+        .json(&serde_json::json!({ "token": "never-existed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        again.json::<serde_json::Value>().await.unwrap()["revoked"],
+        false
+    );
+
+    // Only the pre-revocation read reached the upstream.
+    assert_eq!(upstream.requests().len(), 1);
 }
 
 /// User story: with tenants configured, a tenant may only mint tokens for targets it owns.

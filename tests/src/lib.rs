@@ -7,7 +7,7 @@
 use axum::Router;
 use axum::extract::State;
 use control::{ControlPlane, InMemoryAudit, InMemoryCredentials, Secret};
-use gateway::{Extract, Flavor, Gateway, Outbound, ServerState, Service, ServiceRouter};
+use gateway::{Flavor, Gateway, Outbound, ServerState, Service, ServiceRouter};
 use models::policy::Policy;
 use std::sync::{Arc, Mutex};
 
@@ -56,7 +56,48 @@ async fn record_handler(
     State(requests): State<Arc<Mutex<Vec<Received>>>>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
+
+    // Upgrade branch: echo bytes back over the upgraded connection, so tests can verify
+    // halter tunnels `Connection: Upgrade` (WebSocket/SPDY: kubectl exec/port-forward) end
+    // to end. We record the request, return 101, and splice the upgraded stream to itself.
+    let is_upgrade = parts
+        .headers
+        .get(http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        && parts.headers.contains_key(http::header::UPGRADE);
+    if is_upgrade {
+        requests.lock().unwrap().push(Received {
+            method: parts.method.to_string(),
+            path: parts.uri.path().to_string(),
+            authorization: parts
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            body: Vec::new(),
+        });
+        if let Some(on_upgrade) = parts.extensions.remove::<hyper::upgrade::OnUpgrade>() {
+            tokio::spawn(async move {
+                if let Ok(upgraded) = on_upgrade.await {
+                    let io = hyper_util::rt::TokioIo::new(upgraded);
+                    let (mut r, mut w) = tokio::io::split(io);
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                }
+            });
+        }
+        return axum::response::Response::builder()
+            .status(101)
+            .header(http::header::UPGRADE, "websocket")
+            .header(http::header::CONNECTION, "Upgrade")
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
+
     let body = axum::body::to_bytes(body, 25 * 1024 * 1024)
         .await
         .unwrap_or_default();
@@ -128,18 +169,55 @@ impl Harness {
 /// Start a halter server with a single catch-all GitHub-flavored service pointing at
 /// `upstream_base` (the common case for most tests).
 pub async fn start_halter(upstream_base: &str) -> Harness {
-    start_halter_services(vec![Service {
-        name: "github".to_string(),
-        host: "*".to_string(),
-        upstream_base: upstream_base.to_string(),
-        flavor: Flavor::Github,
-        outbound: Outbound::Bearer {
-            credential: "github-app".to_string(),
-        },
-        address: String::new(),
-        extract: Extract::default(),
-    }])
+    start_halter_services(vec![
+        Service::new("github", "*", upstream_base)
+            .with_flavor(Flavor::Github)
+            .with_outbound(Outbound::Bearer {
+                credential: "github-app".to_string(),
+            }),
+    ])
     .await
+}
+
+/// Start a halter server whose agent-facing proxy terminates TLS with `tls`, on ephemeral
+/// ports. The provision doc carries `tls.ca_pem` as `halter_ca`; the admin API stays
+/// plaintext. The returned `proxy_url` is `https://…`.
+pub async fn start_halter_tls_services(
+    services: Vec<Service>,
+    tls: gateway::TlsMaterial,
+) -> Harness {
+    let credentials = Arc::new(InMemoryCredentials::new());
+    let audit = Arc::new(InMemoryAudit::new());
+    let control = Arc::new(ControlPlane::new(credentials.clone(), audit.clone()));
+    let config = tls.server_config().expect("valid tls material");
+    let gateway = Gateway::new(control.clone(), ServiceRouter::new(services)).with_ca(tls.ca_pem);
+    let state = Arc::new(ServerState::new(gateway));
+
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("https://{}", proxy_listener.local_addr().unwrap());
+    let admin_url = format!("http://{}", admin_listener.local_addr().unwrap());
+
+    let proxy_state = state.clone();
+    tokio::spawn(async move {
+        let _ = gateway::server::serve_proxy_tls(
+            proxy_listener,
+            gateway::proxy_router(proxy_state),
+            config,
+        )
+        .await;
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(admin_listener, gateway::admin_router(state)).await;
+    });
+
+    Harness {
+        control,
+        audit,
+        credentials,
+        proxy_url,
+        admin_url,
+    }
 }
 
 /// Start a halter server with an explicit service allowlist, on ephemeral ports.

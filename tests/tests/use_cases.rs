@@ -15,15 +15,9 @@ fn policy(json: &str) -> Policy {
 
 /// A catch-all service (host `*`) of the given flavor + outbound, pointing at `upstream`.
 fn service(name: &str, flavor: Flavor, outbound: Outbound, upstream: &str) -> Service {
-    Service {
-        name: name.into(),
-        host: "*".into(),
-        upstream_base: upstream.into(),
-        flavor,
-        outbound,
-        address: String::new(),
-        extract: Extract::default(),
-    }
+    Service::new(name, "*", upstream)
+        .with_flavor(flavor)
+        .with_outbound(outbound)
 }
 
 /// Mint a token, fetch the provision doc, and run the real halter-agent config writers
@@ -208,23 +202,19 @@ async fn k8s_use_case() {
 #[tokio::test]
 async fn aws_use_case() {
     let upstream = start_mock_upstream().await;
-    let halter = start_halter_services(vec![Service {
-        name: "ec2".into(),
-        host: "*".into(),
-        upstream_base: upstream.base_url.clone(),
-        flavor: Flavor::Generic,
-        outbound: Outbound::SigV4 {
-            credential: "aws-secret".into(),
-            access_key_id: "REALAKID".into(),
-            region: "us-east-1".into(),
-            service: "ec2".into(),
-        },
-        address: String::new(),
-        extract: Extract {
-            protocol: Protocol::AwsQuery,
-            path_template: None,
-        },
-    }])
+    let halter = start_halter_services(vec![
+        Service::new("ec2", "*", upstream.base_url.clone())
+            .with_outbound(Outbound::SigV4 {
+                credential: "aws-secret".into(),
+                access_key_id: "REALAKID".into(),
+                region: "us-east-1".into(),
+                service: "ec2".into(),
+            })
+            .with_extract(Extract {
+                protocol: Protocol::AwsQuery,
+                path_template: None,
+            }),
+    ])
     .await;
     halter.add_credential("aws-secret", "real-secret-key");
     let home = tempfile::tempdir().unwrap();
@@ -255,6 +245,12 @@ async fn aws_use_case() {
 
     let host = proxy_host(&halter);
     let client = reqwest::Client::new();
+    // Sign at the current wall-clock time — halter checks the request's freshness against
+    // its own clock, exactly as it would for a live `aws` CLI invocation.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
 
     // Helper: sign a body with the dummy cred (what the aws CLI does) and send it.
     let send = |body: &'static [u8]| {
@@ -270,7 +266,7 @@ async fn aws_use_case() {
             "/",
             "",
             body,
-            1_700_000_000_000,
+            now_ms,
         );
         client
             .post(format!("{}/", halter.proxy_url))

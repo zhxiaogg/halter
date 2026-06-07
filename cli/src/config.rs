@@ -20,10 +20,38 @@ pub struct Config {
     /// consumers.
     #[serde(default)]
     pub credentials: HashMap<String, String>,
+    /// Logical credential id → a minting provider that produces short-lived, rotated
+    /// secrets (EKS get-token, GitHub-App installation token). A provider id shadows a
+    /// static `credentials` entry of the same name.
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderConfig>,
     /// Multi-tenant mint authorization: tenant credential → the target names it owns.
     /// Empty = single trust domain (open minting on the localhost admin API).
     #[serde(default)]
     pub tenants: HashMap<String, Vec<String>>,
+    /// Optional TLS termination for the agent-facing proxy listener. Absent = plaintext
+    /// (the sandbox-confined model); present = consumers terminate TLS at halter and trust
+    /// its certificate.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    /// Optional path to a durable JSONL audit log. Absent = `tracing`-only audit (events
+    /// go to the log stream, nothing queryable); present = every decision is also appended
+    /// as one JSON line to this file.
+    #[serde(default)]
+    pub audit_log: Option<std::path::PathBuf>,
+}
+
+/// Paths to the PEM material for TLS termination. Storage/config type.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    /// Path to the serving certificate chain (PEM).
+    pub cert: std::path::PathBuf,
+    /// Path to the serving private key (PEM; PKCS#8, PKCS#1, or SEC1).
+    pub key: std::path::PathBuf,
+    /// Path to the CA bundle consumers must trust (PEM). Defaults to the cert itself (the
+    /// self-signed case) when omitted.
+    #[serde(default)]
+    pub ca: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,12 +79,40 @@ pub struct ServiceConfig {
     /// to validate policies at mint time. Empty = unvalidated (raw).
     #[serde(default)]
     pub catalog: Vec<String>,
+    /// Optional path to an OpenAPI v3 JSON spec; its operations are ingested into the action
+    /// catalog (operationId, or `"<METHOD> <path>"`). Takes precedence over `catalog`.
+    #[serde(default)]
+    pub catalog_openapi: Option<std::path::PathBuf>,
     /// What halter does with upstream auth on allow: `"passthrough"` (default) forwards
     /// the consumer's own credential; `{ "bearer": "<cred-id>" }` injects it as a Bearer
     /// token; `{ "header": { "name": "X-API-Key", "credential": "<cred-id>" } }` injects
     /// it as a custom header.
     #[serde(default)]
     pub outbound: OutboundConfig,
+}
+
+/// A minting credential provider. Tagged by `kind`: `"eks"` presigns an STS get-token,
+/// `"github-app"` exchanges an app JWT for an installation token. Storage/config type.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ProviderConfig {
+    /// AWS EKS `get-token`: a presigned STS `GetCallerIdentity` URL scoped to a cluster.
+    Eks {
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+        cluster_name: String,
+    },
+    /// GitHub-App installation token, minted from the app's RSA private key.
+    GithubApp {
+        app_id: String,
+        installation_id: String,
+        /// Path to the app's PKCS#8 private key PEM.
+        private_key_path: std::path::PathBuf,
+        /// API base; defaults to `https://api.github.com`.
+        #[serde(default)]
+        api_base: Option<String>,
+    },
 }
 
 /// The configured outbound auth stance for a service (see [`ServiceConfig::outbound`]).

@@ -23,6 +23,8 @@ enum Command {
     Status(Common),
     /// Write native tool config (kubeconfig / ~/.aws / git) into a home directory.
     Setup(SetupArgs),
+    /// Remove the native tool config halter previously wrote (per its manifest).
+    Teardown(TeardownArgs),
 }
 
 #[derive(clap::Args)]
@@ -44,6 +46,22 @@ struct SetupArgs {
     home: Option<std::path::PathBuf>,
 }
 
+#[derive(clap::Args)]
+struct TeardownArgs {
+    /// Home directory to remove halter-written config from (defaults to $HOME).
+    #[arg(long)]
+    home: Option<std::path::PathBuf>,
+}
+
+/// Resolve a `--home` override or fall back to `$HOME`.
+fn resolve_home(
+    explicit: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    explicit
+        .or_else(|| std::env::var_os("HOME").map(Into::into))
+        .ok_or_else(|| "no --home and $HOME is unset".into())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
@@ -62,13 +80,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Setup(args) => {
             let doc =
                 cli::agent::fetch_provision(&args.common.admin_url, &args.common.token).await?;
-            let home = args
-                .home
-                .or_else(|| std::env::var_os("HOME").map(Into::into))
-                .ok_or("no --home and $HOME is unset")?;
+            let home = resolve_home(args.home)?;
             let written = cli::agent::write_configs(&home, &doc)?;
             for p in &written {
                 println!("wrote {}", p.display());
+            }
+        }
+        Command::Teardown(args) => {
+            let home = resolve_home(args.home)?;
+            let removed = cli::agent::teardown(&home)?;
+            for p in &removed {
+                println!("removed {}", p.display());
             }
         }
     }

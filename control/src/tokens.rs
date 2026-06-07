@@ -115,6 +115,27 @@ impl Tokens {
     pub fn revoke(&self, token: &str) -> bool {
         self.entries.write().remove(token).is_some()
     }
+
+    /// Evict every entry expired at `now_ms`, returning how many were removed. `resolve`
+    /// already refuses expired entries, but without this the table only grows — every
+    /// SigV4 `/provision` mints a dummy credential that would otherwise never be reclaimed.
+    /// A background sweeper calls this periodically.
+    pub fn sweep(&self, now_ms: u64) -> usize {
+        let mut entries = self.entries.write();
+        let before = entries.len();
+        entries.retain(|_, e| e.expires_at_ms > now_ms);
+        before - entries.len()
+    }
+
+    /// The number of live (un-swept) entries. For metrics/tests.
+    pub fn len(&self) -> usize {
+        self.entries.read().len()
+    }
+
+    /// Whether the token table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -171,5 +192,26 @@ mod tests {
         assert!(tokens.revoke(&minted.token));
         assert!(tokens.resolve(&minted.token, 1).is_none());
         assert!(!tokens.revoke(&minted.token));
+    }
+
+    #[test]
+    fn sweep_evicts_only_expired_entries() {
+        let tokens = Tokens::new();
+        // One short-lived (60s) and one long-lived (3600s) token, minted at t=1000.
+        let short = tokens.mint(empty_policy(), 60, 1_000);
+        let long = tokens.mint(empty_policy(), 3600, 1_000);
+        let dummy = tokens.mint_sigv4(empty_policy(), 60, 1_000);
+        assert_eq!(tokens.len(), 3);
+
+        // At t=61_000 the short token and dummy cred are expired; sweep reclaims exactly
+        // those two and leaves the long-lived token resolvable.
+        assert_eq!(tokens.sweep(61_000), 2);
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens.resolve(&short.token, 61_000).is_none());
+        assert!(tokens.resolve_sigv4(&dummy.access_key_id, 61_000).is_none());
+        assert!(tokens.resolve(&long.token, 61_000).is_some());
+
+        // A second sweep at the same time is a no-op.
+        assert_eq!(tokens.sweep(61_000), 0);
     }
 }

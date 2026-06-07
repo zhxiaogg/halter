@@ -5,13 +5,14 @@
 
 /// How a service's requests are normalized into an `Action`. Also a tool hint the
 /// provision doc surfaces so `halter-agent` writes the right native config.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Flavor {
     /// GitHub-aware resource parsing (repo/pull_request/issue kinds).
     Github,
     /// Kubernetes-aware resource parsing (namespace + resource kind).
     K8s,
     /// Path-based generic parsing — works for any HTTP/JSON or SSE service.
+    #[default]
     Generic,
 }
 
@@ -63,10 +64,40 @@ pub struct Catalog {
 
 impl Catalog {
     /// Build a catalog from a set of known named-action ids (e.g. "ec2:DescribeInstances").
+    /// This is the static-config ingester; richer ingesters ([`Catalog::from_openapi`], and
+    /// future k8s-discovery / AWS-SAR sources) produce the same `Catalog`, so policy
+    /// validation never changes when a source is swapped in.
     pub fn of(actions: impl IntoIterator<Item = String>) -> Self {
         Self {
             actions: actions.into_iter().collect(),
         }
+    }
+
+    /// Ingest an OpenAPI v3 document (as parsed JSON) into a catalog: every operation's
+    /// `operationId` becomes a known action, falling back to `"<METHOD> <path>"` (e.g.
+    /// `"GET /pets/{id}"`) when an operation declares none. A spec with no operations yields
+    /// an empty (raw) catalog.
+    pub fn from_openapi(spec: &serde_json::Value) -> Self {
+        const METHODS: [&str; 7] = ["get", "put", "post", "delete", "patch", "head", "options"];
+        let mut actions = std::collections::BTreeSet::new();
+        let Some(paths) = spec.get("paths").and_then(|p| p.as_object()) else {
+            return Self::default();
+        };
+        for (path, item) in paths {
+            let Some(item) = item.as_object() else {
+                continue;
+            };
+            for method in METHODS {
+                let Some(op) = item.get(method) else { continue };
+                let action = op
+                    .get("operationId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{} {path}", method.to_ascii_uppercase()));
+                actions.insert(action);
+            }
+        }
+        Self { actions }
     }
 
     /// Whether this catalog is absent (no semantic validation — raw).
@@ -105,9 +136,10 @@ impl Flavor {
 /// default (`Passthrough`), credential-hiding via one of the inject mechanisms. The
 /// credential is a property of the service instance, never named in policy. (SigV4 — a
 /// request *transform* rather than a header set — is added as its own arm later.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Outbound {
     /// Forward the consumer's own credential unchanged (filter-only).
+    #[default]
     Passthrough,
     /// Inject the vault credential as `Authorization: Bearer <secret>`.
     Bearer { credential: String },
@@ -138,8 +170,11 @@ impl Outbound {
     }
 }
 
-/// One configured upstream service instance.
-#[derive(Clone, Debug)]
+/// One configured upstream service instance. Build with [`Service::new`] + the `with_*`
+/// setters rather than filling all seven fields positionally; everything but the name,
+/// host, and upstream base has a sensible default (generic flavor, passthrough outbound,
+/// no consumer address, Tier-0 extraction).
+#[derive(Clone, Debug, Default)]
 pub struct Service {
     /// Logical instance name; becomes `Action.target` and what policy rules scope to.
     pub name: String,
@@ -157,6 +192,51 @@ pub struct Service {
     pub address: String,
     /// How requests are normalized into an `Action` (protocol + field extraction).
     pub extract: Extract,
+}
+
+impl Service {
+    /// Start a service with the three required fields; flavor/outbound/address/extract take
+    /// their defaults. Chain the `with_*` setters to override.
+    pub fn new(
+        name: impl Into<String>,
+        host: impl Into<String>,
+        upstream_base: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            host: host.into(),
+            upstream_base: upstream_base.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Set the normalization flavor.
+    #[must_use]
+    pub fn with_flavor(mut self, flavor: Flavor) -> Self {
+        self.flavor = flavor;
+        self
+    }
+
+    /// Set the outbound auth stance.
+    #[must_use]
+    pub fn with_outbound(mut self, outbound: Outbound) -> Self {
+        self.outbound = outbound;
+        self
+    }
+
+    /// Set the consumer-facing address surfaced in the provision doc.
+    #[must_use]
+    pub fn with_address(mut self, address: impl Into<String>) -> Self {
+        self.address = address.into();
+        self
+    }
+
+    /// Set the extraction config (protocol + field capture).
+    #[must_use]
+    pub fn with_extract(mut self, extract: Extract) -> Self {
+        self.extract = extract;
+        self
+    }
 }
 
 /// Routes an inbound request to a service by its `Host`. First match wins, so put more
@@ -212,15 +292,7 @@ mod tests {
     use super::*;
 
     fn svc(name: &str, host: &str) -> Service {
-        Service {
-            name: name.into(),
-            host: host.into(),
-            upstream_base: format!("https://{name}.example"),
-            flavor: Flavor::Generic,
-            outbound: Outbound::Passthrough,
-            address: String::new(),
-            extract: Extract::default(),
-        }
+        Service::new(name, host, format!("https://{name}.example"))
     }
 
     #[test]
@@ -256,6 +328,29 @@ mod tests {
             r.route("api.github.com").map(|s| s.name.as_str()),
             Some("specific")
         );
+    }
+
+    #[test]
+    fn openapi_ingester_collects_operation_ids_with_fallback() {
+        let spec = serde_json::json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/pets": {
+                    "get": { "operationId": "listPets" },
+                    "post": { "operationId": "createPet" }
+                },
+                // No operationId → falls back to "<METHOD> <path>".
+                "/pets/{id}": { "get": {} }
+            }
+        });
+        let catalog = Catalog::from_openapi(&spec);
+        assert!(!catalog.is_empty());
+        assert!(catalog.knows("listPets"));
+        assert!(catalog.knows("createPet"));
+        assert!(catalog.knows("GET /pets/{id}"));
+        assert!(!catalog.knows("deletePet"));
+        // A spec with no paths is a raw (empty) catalog.
+        assert!(Catalog::from_openapi(&serde_json::json!({})).is_empty());
     }
 
     #[test]

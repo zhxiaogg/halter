@@ -70,6 +70,22 @@ impl action::Verb {
     pub fn action(id: impl Into<String>) -> Self {
         action::Verb::Action(action::NamedVerb { id: id.into() })
     }
+
+    /// Parse a compact verb shorthand: the case-insensitive CRUD words `read`/`create`/
+    /// `update`/`delete` map to the closed [`action::CrudVerb`] arm; anything else is a
+    /// named action verb. This is the terse spelling a policy-authoring layer expands into
+    /// the verbose tagged-union JSON the wire format requires
+    /// (`{"type":"Crud","value":{"kind":"Read"}}`), so operators and call sites can write
+    /// `"read"` or `"ec2:DescribeInstances"` instead.
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "read" => Self::crud(action::CrudKind::Read),
+            "create" => Self::crud(action::CrudKind::Create),
+            "update" => Self::crud(action::CrudKind::Update),
+            "delete" => Self::crud(action::CrudKind::Delete),
+            _ => Self::action(s),
+        }
+    }
 }
 
 impl action::Resource {
@@ -130,6 +146,16 @@ mod tests {
         let json = serde_json::to_string(&action).unwrap();
         let back: Action = serde_json::from_str(&json).unwrap();
         assert_eq!(action, back);
+    }
+
+    #[test]
+    fn verb_parse_shorthand_maps_crud_words_and_named_actions() {
+        assert_eq!(Verb::parse("read"), Verb::crud(CrudKind::Read));
+        assert_eq!(Verb::parse("DELETE"), Verb::crud(CrudKind::Delete));
+        assert_eq!(
+            Verb::parse("ec2:DescribeInstances"),
+            Verb::action("ec2:DescribeInstances")
+        );
     }
 
     #[test]

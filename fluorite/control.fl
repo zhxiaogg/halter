@@ -18,3 +18,15 @@ struct MintResponse {
     token: String,
     expires_at_ms: u64,
 }
+
+/// Revoke a token immediately, before its TTL expires. The presenter holds the token, so
+/// presenting it is sufficient authorization to invalidate it.
+struct RevokeRequest {
+    token: String,
+}
+
+/// The result of a revoke: whether a live token was actually removed (`false` if it was
+/// already unknown, expired, or revoked).
+struct RevokeResponse {
+    revoked: bool,
+}

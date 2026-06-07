@@ -8,8 +8,8 @@
 //! forward. Keeping this layer free of HTTP plumbing makes the whole decision path
 //! deterministically testable.
 
-use crate::normalize;
 use crate::service::{Catalog, Outbound, Service, ServiceRouter};
+use crate::{canonicalize, normalize};
 use control::{ControlPlane, now_ms};
 use models::action::Action;
 use models::audit::{AuditEvent, Decision};
@@ -63,6 +63,9 @@ pub struct Gateway {
     /// Per-target action catalogs used to validate policies at mint time. A target with
     /// no entry (or an empty catalog) is unvalidated (raw).
     catalogs: HashMap<String, Catalog>,
+    /// The CA bundle a consumer must trust to validate halter's TLS, surfaced in the
+    /// provision doc. Empty when halter terminates plaintext (the sandbox-confined model).
+    halter_ca: String,
 }
 
 impl Gateway {
@@ -74,6 +77,7 @@ impl Gateway {
             router,
             clock: Arc::new(now_ms),
             catalogs: HashMap::new(),
+            halter_ca: String::new(),
         }
     }
 
@@ -84,6 +88,7 @@ impl Gateway {
             router,
             clock,
             catalogs: HashMap::new(),
+            halter_ca: String::new(),
         }
     }
 
@@ -91,6 +96,14 @@ impl Gateway {
     #[must_use]
     pub fn with_catalogs(mut self, catalogs: HashMap<String, Catalog>) -> Self {
         self.catalogs = catalogs;
+        self
+    }
+
+    /// Set the CA bundle consumers must trust to validate halter's TLS (surfaced as
+    /// `halter_ca` in the provision doc). Builder; empty means plaintext.
+    #[must_use]
+    pub fn with_ca(mut self, ca_pem: impl Into<String>) -> Self {
+        self.halter_ca = ca_pem.into();
         self
     }
 
@@ -116,52 +129,77 @@ impl Gateway {
         policy: models::policy::Policy,
         ttl_seconds: u64,
         tenant: Option<&str>,
-    ) -> Result<models::control::MintResponse, String> {
+    ) -> Result<models::control::MintResponse, MintError> {
         if !self.control.tenants.is_empty() {
-            let key = tenant.ok_or("missing tenant credential")?;
+            let key = tenant.ok_or(MintError::MissingTenant)?;
             let owned = self
                 .control
                 .tenants
                 .owned(key)
-                .ok_or("unknown tenant credential")?;
+                .ok_or(MintError::UnknownTenant)?;
             validate_tenant_policy(&policy, &owned)?;
         }
         self.validate_catalog(&policy)?;
         Ok(self.mint(policy, ttl_seconds))
     }
 
-    /// Validate a policy's named-action verbs against the catalog of each explicit target
-    /// it scopes to. A target with no catalog is unvalidated (raw); a known action passes;
-    /// an unknown action **rejects the mint** (fail closed) — catching typos and stale
-    /// assumptions before a token exists. CRUD verbs are always valid (Tier 0).
-    fn validate_catalog(&self, policy: &models::policy::Policy) -> Result<(), String> {
+    /// Validate a policy's named-action verbs against the catalogs. A target with no catalog
+    /// is unvalidated (raw); a known action passes; an unknown action **rejects the mint**
+    /// (fail closed) — catching typos and stale assumptions before a token exists. CRUD
+    /// verbs are always valid (Tier 0).
+    ///
+    /// Both rule shapes are covered: a rule that names explicit targets is checked against
+    /// each named target's catalog; an **empty-target** (any-service) allow rule — which the
+    /// old check skipped entirely — must have its named action known by *at least one*
+    /// configured catalog, so a typo can't slip through on the broadest rule of all.
+    fn validate_catalog(&self, policy: &models::policy::Policy) -> Result<(), MintError> {
         use models::action::Verb;
         use models::policy::Effect;
+        let nonempty: Vec<&Catalog> = self.catalogs.values().filter(|c| !c.is_empty()).collect();
         for rule in &policy.rules {
             if rule.effect != Effect::Allow {
                 continue;
             }
-            for target in &rule.matches.targets {
-                let Some(catalog) = self.catalogs.get(target) else {
+            for verb in &rule.matches.verbs {
+                let Verb::Action(named) = verb else {
                     continue;
                 };
-                if catalog.is_empty() {
-                    continue;
-                }
-                for verb in &rule.matches.verbs {
-                    let Verb::Action(named) = verb else {
-                        continue;
-                    };
-                    if !catalog.knows(&named.id) {
-                        return Err(format!(
-                            "action '{}' is not in the catalog for target '{target}'",
-                            named.id
-                        ));
+                if rule.matches.targets.is_empty() {
+                    // Any-service rule: require the action to be known by some catalog (when
+                    // any catalogs are configured); skip when everything is raw.
+                    if !nonempty.is_empty() && !nonempty.iter().any(|c| c.knows(&named.id)) {
+                        return Err(MintError::UnknownAction {
+                            target: "*".to_string(),
+                            action: named.id.clone(),
+                        });
+                    }
+                } else {
+                    for target in &rule.matches.targets {
+                        let Some(catalog) = self.catalogs.get(target) else {
+                            continue;
+                        };
+                        if !catalog.is_empty() && !catalog.knows(&named.id) {
+                            return Err(MintError::UnknownAction {
+                                target: target.clone(),
+                                action: named.id.clone(),
+                            });
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Revoke a token immediately. Returns whether a live token was removed.
+    pub fn revoke(&self, token: &str) -> bool {
+        self.control.tokens.revoke(token)
+    }
+
+    /// Evict expired token-table entries, returning the count reclaimed. Driven by the
+    /// server's background sweeper so the table doesn't grow without bound.
+    pub fn sweep_expired(&self) -> usize {
+        self.control.tokens.sweep((self.clock)())
     }
 
     /// Project a [`ProvisionDoc`] for the consumer holding `token`: the token's bound
@@ -173,7 +211,7 @@ impl Gateway {
         let (policy, expires_at_ms) = self.control.tokens.resolve_full(token, now)?;
         Some(models::provision::ProvisionDoc {
             halter_token: token.to_string(),
-            halter_ca: String::new(),
+            halter_ca: self.halter_ca.clone(),
             expires_at_ms,
             services: self.provisionable_services(token, &policy, now, expires_at_ms),
         })
@@ -206,27 +244,31 @@ impl Gateway {
             }
         }
         let ttl_remaining = (expires_at_ms.saturating_sub(now) / 1000).max(1);
-        self.router
-            .services()
-            .iter()
-            .filter(|s| any_target || named.contains(s.name.as_str()))
-            .map(|s| {
-                let (mode, auth) = self.provision_auth(s, token, policy, now, ttl_remaining);
-                models::provision::ProvisionService {
-                    target: s.name.clone(),
-                    flavor: s.flavor.name().to_string(),
-                    address: s.address.clone(),
-                    mode,
-                    auth,
-                }
-            })
-            .collect()
+        // Explicit loop, not a `.map()`: producing each entry *mints a dummy credential*
+        // for SigV4 services — a side effect that must not hide inside what reads as a pure
+        // projection.
+        let mut out = Vec::new();
+        for s in self.router.services() {
+            if !(any_target || named.contains(s.name.as_str())) {
+                continue;
+            }
+            let (mode, auth) = self.mint_service_auth(s, token, policy, now, ttl_remaining);
+            out.push(models::provision::ProvisionService {
+                target: s.name.clone(),
+                flavor: s.flavor.name().to_string(),
+                address: s.address.clone(),
+                mode,
+                auth,
+            });
+        }
+        out
     }
 
-    /// The consumer mode + auth material for one service. SigV4 services get a freshly
-    /// minted dummy credential bound to the same policy; everything else uses the bearer
-    /// halter token.
-    fn provision_auth(
+    /// Produce the consumer mode + auth material for one service. **This mints**: a SigV4
+    /// service gets a freshly minted dummy credential bound to the same policy (hence the
+    /// `mint_` name and the explicit caller loop); everything else reuses the bearer halter
+    /// token and has no effect.
+    fn mint_service_auth(
         &self,
         service: &Service,
         token: &str,
@@ -321,31 +363,25 @@ impl Gateway {
             .tokens
             .resolve_sigv4(&parsed.access_key_id, now)
             .ok_or_else(unauth)?;
-        let host = extract_host(&req.headers).unwrap_or_default();
-        let amz_date = header_str(&req.headers, "x-amz-date").ok_or_else(unauth)?;
-        let content_sha = header_str(&req.headers, "x-amz-content-sha256").ok_or_else(unauth)?;
-        let valid = crate::sigv4::verify(
+        // Recompute over exactly the headers the client signed (read live from the
+        // request) and bound replay via the `x-amz-date` freshness window.
+        match crate::sigv4::verify(
             &secret,
-            &parsed.region,
-            &parsed.service,
+            &parsed,
             req.method.as_str(),
-            &host,
             &req.path,
             &req.query,
-            &content_sha,
-            &amz_date,
-            &parsed.datestamp,
-            &parsed.signature,
-        );
-        if valid {
-            Ok((policy, AuthSource::SigV4))
-        } else {
-            Err(unauth())
+            &req.headers,
+            &req.body,
+            now,
+        ) {
+            Ok(()) => Ok((policy, AuthSource::SigV4)),
+            Err(_) => Err(unauth()),
         }
     }
 
     /// Authenticate, authorize, and (on allow) plan the upstream forward.
-    pub fn handle(&self, req: ProxyRequest) -> Outcome {
+    pub fn handle(&self, mut req: ProxyRequest) -> Outcome {
         let now = (self.clock)();
 
         let (policy, source) = match self.authenticate(&req, now) {
@@ -365,7 +401,23 @@ impl Gateway {
             );
         };
 
-        let action = normalize::normalize(&service, &req);
+        // Fold the path into its canonical form *before* deciding or forwarding, so a
+        // disguised path (dot traversal, double/trailing slashes, encoded separators) can't
+        // slip past the resource globs. A root escape fails closed. The decision uses the
+        // decoded view; the forward/sign uses the re-encoded view.
+        let canonical = match canonicalize::path(&req.path) {
+            Ok(c) => c,
+            Err(_) => {
+                self.audit_raw(&host, Decision::Deny, "non-canonical path", now);
+                return reject(
+                    http::StatusCode::BAD_REQUEST,
+                    DenyReason::NotAllowed,
+                    "non-canonical request path",
+                );
+            }
+        };
+        let action = normalize::normalize(&service, &req, &canonical.decoded);
+        req.path = canonical.encoded;
 
         match policy::decide(&action, &policy) {
             Verdict::Deny(d) => {
@@ -570,14 +622,6 @@ fn extract_host(headers: &http::HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A header's value as a `String`, if present and valid UTF-8.
-fn header_str(headers: &http::HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-}
-
 fn reject(status: http::StatusCode, reason: DenyReason, message: &str) -> Outcome {
     Outcome::Reject(Rejection {
         status,
@@ -592,23 +636,62 @@ fn reject(status: http::StatusCode, reason: DenyReason, message: &str) -> Outcom
 fn validate_tenant_policy(
     policy: &models::policy::Policy,
     owned: &std::collections::BTreeSet<String>,
-) -> Result<(), String> {
+) -> Result<(), MintError> {
     use models::policy::Effect;
     for rule in &policy.rules {
         if rule.effect != Effect::Allow {
             continue;
         }
         if rule.matches.targets.is_empty() {
-            return Err("tenant allow rules must name explicit targets".to_string());
+            return Err(MintError::TenantWildcardTarget);
         }
         for t in &rule.matches.targets {
             if !owned.contains(t.as_str()) {
-                return Err(format!("target '{t}' is not owned by this tenant"));
+                return Err(MintError::TargetNotOwned(t.clone()));
             }
         }
     }
     Ok(())
 }
+
+/// Why a mint request was refused. A typed error so the data plane maps each cause to a
+/// precise response instead of threading an opaque `String`. All variants are
+/// authorization/validation failures the operator surface renders as `403`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MintError {
+    /// Tenants are configured but the request presented no tenant credential.
+    MissingTenant,
+    /// The presented tenant credential is not registered.
+    UnknownTenant,
+    /// A tenant allow rule named a target the tenant does not own.
+    TargetNotOwned(String),
+    /// A tenant allow rule left `targets` empty — that would grant *any* service, unsafe
+    /// across trust domains.
+    TenantWildcardTarget,
+    /// A named-action verb is absent from the target's action catalog.
+    UnknownAction { target: String, action: String },
+}
+
+impl std::fmt::Display for MintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MintError::MissingTenant => f.write_str("missing tenant credential"),
+            MintError::UnknownTenant => f.write_str("unknown tenant credential"),
+            MintError::TargetNotOwned(t) => write!(f, "target '{t}' is not owned by this tenant"),
+            MintError::TenantWildcardTarget => {
+                f.write_str("tenant allow rules must name explicit targets")
+            }
+            MintError::UnknownAction { target, action } => {
+                write!(
+                    f,
+                    "action '{action}' is not in the catalog for target '{target}'"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MintError {}
 
 /// The dedicated header a consumer uses to present its halter token *without* consuming
 /// the `Authorization` slot — so a filter-only (passthrough) consumer can carry its own
@@ -728,46 +811,28 @@ mod tests {
 
     /// A catch-all GitHub-flavored service that injects the `github-app` credential.
     fn router() -> ServiceRouter {
-        ServiceRouter::new(vec![Service {
-            name: "github".into(),
-            host: "*".into(),
-            upstream_base: "https://api.github.com".into(),
-            flavor: Flavor::Github,
-            outbound: Outbound::Bearer {
-                credential: "github-app".into(),
-            },
-            address: String::new(),
-            extract: Extract::default(),
-        }])
+        ServiceRouter::new(vec![
+            Service::new("github", "*", "https://api.github.com")
+                .with_flavor(Flavor::Github)
+                .with_outbound(Outbound::Bearer {
+                    credential: "github-app".into(),
+                }),
+        ])
     }
 
     /// A catch-all generic service that forwards the consumer's own credential.
     fn router_passthrough() -> ServiceRouter {
-        ServiceRouter::new(vec![Service {
-            name: "svc".into(),
-            host: "*".into(),
-            upstream_base: "https://up.example".into(),
-            flavor: Flavor::Generic,
-            outbound: Outbound::Passthrough,
-            address: String::new(),
-            extract: Extract::default(),
-        }])
+        ServiceRouter::new(vec![Service::new("svc", "*", "https://up.example")])
     }
 
     /// A catch-all generic service that injects a credential as `X-API-Key`.
     fn router_header() -> ServiceRouter {
-        ServiceRouter::new(vec![Service {
-            name: "keyed".into(),
-            host: "*".into(),
-            upstream_base: "https://api.keyed.com".into(),
-            flavor: Flavor::Generic,
-            outbound: Outbound::Header {
+        ServiceRouter::new(vec![
+            Service::new("keyed", "*", "https://api.keyed.com").with_outbound(Outbound::Header {
                 name: "X-API-Key".into(),
                 credential: "keyed-key".into(),
-            },
-            address: String::new(),
-            extract: Extract::default(),
-        }])
+            }),
+        ])
     }
 
     fn allow_all() -> Policy {
@@ -981,20 +1046,16 @@ mod tests {
     fn sigv4_mechanism_signs_outbound_request() {
         let (control, _a, creds) = test_control();
         creds.insert("aws-secret", Secret::new("secret-key"));
-        let router = ServiceRouter::new(vec![Service {
-            name: "ec2".into(),
-            host: "*".into(),
-            upstream_base: "https://ec2.us-east-1.amazonaws.com".into(),
-            flavor: Flavor::Generic,
-            outbound: Outbound::SigV4 {
-                credential: "aws-secret".into(),
-                access_key_id: "AKID".into(),
-                region: "us-east-1".into(),
-                service: "ec2".into(),
-            },
-            address: String::new(),
-            extract: Extract::default(),
-        }]);
+        let router = ServiceRouter::new(vec![
+            Service::new("ec2", "*", "https://ec2.us-east-1.amazonaws.com").with_outbound(
+                Outbound::SigV4 {
+                    credential: "aws-secret".into(),
+                    access_key_id: "AKID".into(),
+                    region: "us-east-1".into(),
+                    service: "ec2".into(),
+                },
+            ),
+        ]);
         let gw = Gateway::with_clock(control, router, fixed_clock(1_700_000_000_000));
         let minted = gw.mint(allow_all(), 60);
         match gw.handle(get(bearer(&minted.token), "/")) {
@@ -1060,23 +1121,23 @@ mod tests {
     }
 
     fn aws_router() -> ServiceRouter {
-        ServiceRouter::new(vec![Service {
-            name: "ec2".into(),
-            host: "ec2.amazonaws.com".into(),
-            upstream_base: "https://ec2.us-east-1.amazonaws.com".into(),
-            flavor: Flavor::Generic,
-            outbound: Outbound::SigV4 {
+        ServiceRouter::new(vec![
+            Service::new(
+                "ec2",
+                "ec2.amazonaws.com",
+                "https://ec2.us-east-1.amazonaws.com",
+            )
+            .with_outbound(Outbound::SigV4 {
                 credential: "aws-secret".into(),
                 access_key_id: "REALAKID".into(),
                 region: "us-east-1".into(),
                 service: "ec2".into(),
-            },
-            address: String::new(),
-            extract: Extract {
+            })
+            .with_extract(Extract {
                 protocol: crate::service::Protocol::AwsQuery,
                 path_template: None,
-            },
-        }])
+            }),
+        ])
     }
 
     #[test]
@@ -1173,26 +1234,13 @@ mod tests {
 
     fn two_service_router() -> ServiceRouter {
         ServiceRouter::new(vec![
-            Service {
-                name: "github".into(),
-                host: "api.github.com".into(),
-                upstream_base: "https://api.github.com".into(),
-                flavor: Flavor::Github,
-                outbound: Outbound::Bearer {
+            Service::new("github", "api.github.com", "https://api.github.com")
+                .with_flavor(Flavor::Github)
+                .with_outbound(Outbound::Bearer {
                     credential: "github-app".into(),
-                },
-                address: "https://gh.halter.local".into(),
-                extract: Extract::default(),
-            },
-            Service {
-                name: "openai".into(),
-                host: "api.openai.com".into(),
-                upstream_base: "https://api.openai.com".into(),
-                flavor: Flavor::Generic,
-                outbound: Outbound::Passthrough,
-                address: String::new(),
-                extract: Extract::default(),
-            },
+                })
+                .with_address("https://gh.halter.local"),
+            Service::new("openai", "api.openai.com", "https://api.openai.com"),
         ])
     }
 
@@ -1282,6 +1330,32 @@ mod tests {
             }],
         };
         assert!(gw.mint_checked(raw, 60, None).is_ok());
+    }
+
+    #[test]
+    fn catalog_validates_empty_target_named_actions() {
+        use crate::service::Catalog;
+        let (control, _a, _) = test_control();
+        let mut catalogs = std::collections::HashMap::new();
+        catalogs.insert("github".to_string(), Catalog::of(["repo:read".to_string()]));
+        let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000))
+            .with_catalogs(catalogs);
+
+        let any_target = |action: &str| Policy {
+            rules: vec![Rule {
+                effect: Effect::Allow,
+                matches: Match {
+                    targets: vec![], // any service — the old check skipped these entirely
+                    verbs: vec![models::action::Verb::action(action)],
+                    resources: vec![],
+                    conditions: vec![],
+                },
+            }],
+        };
+        // Known by some catalog → ok.
+        assert!(gw.mint_checked(any_target("repo:read"), 60, None).is_ok());
+        // Known by no catalog → rejected even though no target is named (fail closed).
+        assert!(gw.mint_checked(any_target("repo:typo"), 60, None).is_err());
     }
 
     #[test]

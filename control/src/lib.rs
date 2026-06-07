@@ -5,14 +5,19 @@
 
 pub mod audit;
 pub mod credentials;
+pub mod providers;
 pub mod tenants;
 pub mod tokens;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use audit::{AuditSink, InMemoryAudit, TracingAudit};
+pub use audit::{AuditSink, FileAudit, InMemoryAudit, TracingAudit};
 pub use credentials::{CredentialStore, InMemoryCredentials, Secret};
+pub use providers::{
+    CachingCredentials, CredentialProvider, EksGetTokenProvider, GitHubAppProvider, MintedSecret,
+    pkcs8_from_pem, spawn_refresher,
+};
 pub use tenants::Tenants;
 pub use tokens::{SigV4Mint, Tokens};
 
