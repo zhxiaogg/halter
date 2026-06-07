@@ -175,16 +175,21 @@ impl Gateway {
             halter_token: token.to_string(),
             halter_ca: String::new(),
             expires_at_ms,
-            services: self.provisionable_services(&policy),
+            services: self.provisionable_services(token, &policy, now, expires_at_ms),
         })
     }
 
     /// The services a policy grants the consumer access to: every service whose name a
     /// rule's `targets` names, or — if any allow rule has empty `targets` (= any
-    /// service) — all of them.
+    /// service) — all of them. Each entry carries the credential material the consumer
+    /// presents: the halter token for bearer/passthrough services, or a freshly minted
+    /// dummy SigV4 credential (bound to the same policy) for SigV4 services.
     fn provisionable_services(
         &self,
+        token: &str,
         policy: &models::policy::Policy,
+        now: u64,
+        expires_at_ms: u64,
     ) -> Vec<models::provision::ProvisionService> {
         use models::policy::Effect;
         let mut any_target = false;
@@ -200,22 +205,65 @@ impl Gateway {
                 named.insert(t.as_str());
             }
         }
+        let ttl_remaining = (expires_at_ms.saturating_sub(now) / 1000).max(1);
         self.router
             .services()
             .iter()
             .filter(|s| any_target || named.contains(s.name.as_str()))
-            .map(|s| models::provision::ProvisionService {
-                target: s.name.clone(),
-                flavor: s.flavor.name().to_string(),
-                address: s.address.clone(),
-                mode: match s.outbound {
-                    Outbound::Passthrough => models::provision::ProvisionMode::Passthrough,
-                    Outbound::Bearer { .. } | Outbound::Header { .. } | Outbound::SigV4 { .. } => {
-                        models::provision::ProvisionMode::Inject
-                    }
-                },
+            .map(|s| {
+                let (mode, auth) = self.provision_auth(s, token, policy, now, ttl_remaining);
+                models::provision::ProvisionService {
+                    target: s.name.clone(),
+                    flavor: s.flavor.name().to_string(),
+                    address: s.address.clone(),
+                    mode,
+                    auth,
+                }
             })
             .collect()
+    }
+
+    /// The consumer mode + auth material for one service. SigV4 services get a freshly
+    /// minted dummy credential bound to the same policy; everything else uses the bearer
+    /// halter token.
+    fn provision_auth(
+        &self,
+        service: &Service,
+        token: &str,
+        policy: &models::policy::Policy,
+        now: u64,
+        ttl_remaining: u64,
+    ) -> (
+        models::provision::ProvisionMode,
+        models::provision::ProvisionAuth,
+    ) {
+        use models::provision::{BearerAuth, ProvisionAuth, ProvisionMode, SigV4Auth};
+        match &service.outbound {
+            Outbound::SigV4 { region, .. } => {
+                let dummy = self
+                    .control
+                    .tokens
+                    .mint_sigv4(policy.clone(), ttl_remaining, now);
+                let auth = ProvisionAuth::SigV4(SigV4Auth {
+                    access_key_id: dummy.access_key_id,
+                    secret_access_key: dummy.secret_access_key,
+                    region: region.clone(),
+                });
+                (ProvisionMode::Inject, auth)
+            }
+            Outbound::Passthrough => (
+                ProvisionMode::Passthrough,
+                ProvisionAuth::Bearer(BearerAuth {
+                    token: token.to_string(),
+                }),
+            ),
+            Outbound::Bearer { .. } | Outbound::Header { .. } => (
+                ProvisionMode::Inject,
+                ProvisionAuth::Bearer(BearerAuth {
+                    token: token.to_string(),
+                }),
+            ),
+        }
     }
 
     /// Authenticate the request to its bound policy. Two inbound schemes: AWS SigV4 (the

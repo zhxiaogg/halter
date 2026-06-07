@@ -19,6 +19,7 @@ pub fn normalize(service: &Service, req: &ProxyRequest) -> Action {
     let path = req.path.trim_start_matches('/');
     let resource = match service.flavor {
         Flavor::Github => github_resource(path),
+        Flavor::K8s => k8s_resource(path),
         Flavor::Generic => generic_resource(path),
     };
     let verb = verb_for_protocol(service.extract.protocol, req);
@@ -128,6 +129,23 @@ fn github_resource(path: &str) -> Resource {
         [first, ..] => first,
         [] => "other",
     };
+    Resource::of(path, kind)
+}
+
+/// Kubernetes-aware resource parsing: the resource kind is the collection after the
+/// namespace name (`…/namespaces/dev/pods` → `pods`), else the last path segment.
+fn k8s_resource(path: &str) -> Resource {
+    if path.is_empty() {
+        return Resource::of("", "root");
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    let kind = segs
+        .iter()
+        .position(|s| *s == "namespaces")
+        .and_then(|i| segs.get(i + 2))
+        .or_else(|| segs.last())
+        .copied()
+        .unwrap_or("resource");
     Resource::of(path, kind)
 }
 

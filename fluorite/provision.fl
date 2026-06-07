@@ -11,6 +11,27 @@ enum ProvisionMode {
     Passthrough,
 }
 
+/// What the consumer presents to halter to authenticate for a service.
+struct BearerAuth {
+    /// The halter token (presented via `X-Halter-Token`, or `Authorization: Bearer`).
+    token: String,
+}
+
+/// A dummy AWS SigV4 credential the consumer's tooling signs with; halter verifies it and
+/// re-signs outbound with the real account credential. Useless against real AWS.
+struct SigV4Auth {
+    access_key_id: String,
+    secret_access_key: String,
+    region: String,
+}
+
+/// The credential material the consumer uses for a service.
+#[type_tag = "type"]
+union ProvisionAuth {
+    Bearer(BearerAuth),
+    SigV4(SigV4Auth),
+}
+
 /// One service the consumer should configure to reach through halter.
 struct ProvisionService {
     /// Service instance name (`Action.target`).
@@ -21,6 +42,8 @@ struct ProvisionService {
     address: String,
     /// Whether halter injects the credential or the consumer must supply its own.
     mode: ProvisionMode,
+    /// The credential material the consumer presents to halter for this service.
+    auth: ProvisionAuth,
 }
 
 /// The setup bundle. Safe to return to the token holder: it carries the halter token the

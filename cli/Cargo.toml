@@ -5,6 +5,10 @@ license.workspace = true
 version.workspace = true
 publish = false
 
+[lib]
+name = "cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "halter"
 path = "src/main.rs"

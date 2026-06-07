@@ -3,11 +3,14 @@
 //! whose host matches no service is denied (fail closed). Each service names how its
 //! requests are normalized into an `Action` (its [`Flavor`]).
 
-/// How a service's requests are normalized into an `Action`.
+/// How a service's requests are normalized into an `Action`. Also a tool hint the
+/// provision doc surfaces so `halter-agent` writes the right native config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flavor {
     /// GitHub-aware resource parsing (repo/pull_request/issue kinds).
     Github,
+    /// Kubernetes-aware resource parsing (namespace + resource kind).
+    K8s,
     /// Path-based generic parsing — works for any HTTP/JSON or SSE service.
     Generic,
 }
@@ -82,6 +85,7 @@ impl Flavor {
     pub fn parse(name: Option<&str>) -> Self {
         match name {
             Some(n) if n.eq_ignore_ascii_case("github") => Flavor::Github,
+            Some(n) if n.eq_ignore_ascii_case("k8s") => Flavor::K8s,
             _ => Flavor::Generic,
         }
     }
@@ -90,6 +94,7 @@ impl Flavor {
     pub fn name(self) -> &'static str {
         match self {
             Flavor::Github => "github",
+            Flavor::K8s => "k8s",
             Flavor::Generic => "generic",
         }
     }

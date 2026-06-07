@@ -5,10 +5,8 @@
 //! server's admin API to issue a launch token bound to that policy (handy for manual
 //! testing; in production the orchestrator calls the admin API directly).
 
-mod config;
-
 use clap::{Parser, Subcommand};
-use config::{Config, OutboundConfig};
+use cli::config::{Config, OutboundConfig};
 use control::{ControlPlane, InMemoryCredentials, Secret, TracingAudit};
 use gateway::{Catalog, Extract, Flavor, Gateway, Outbound, Protocol, Service, ServiceRouter};
 use models::control::{MintRequest, MintResponse};
