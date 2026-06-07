@@ -218,24 +218,91 @@ impl Gateway {
             .collect()
     }
 
+    /// Authenticate the request to its bound policy. Two inbound schemes: AWS SigV4 (the
+    /// `Authorization` header is `AWS4-HMAC-SHA256 …`, verified against a minted dummy
+    /// credential) or a halter bearer token (`X-Halter-Token` or `Authorization: Bearer`).
+    fn authenticate(
+        &self,
+        req: &ProxyRequest,
+        now: u64,
+    ) -> Result<(models::policy::Policy, AuthSource), Box<Outcome>> {
+        if let Some(auth) = req
+            .headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            && auth.starts_with("AWS4-HMAC-SHA256")
+        {
+            return self.authenticate_sigv4(req, auth, now);
+        }
+        let Some((token, source)) = extract_auth(&req.headers) else {
+            return Err(Box::new(reject(
+                http::StatusCode::UNAUTHORIZED,
+                DenyReason::Unauthenticated,
+                "missing halter token",
+            )));
+        };
+        match self.control.tokens.resolve(&token, now) {
+            Some(policy) => Ok((policy, source)),
+            None => Err(Box::new(reject(
+                http::StatusCode::UNAUTHORIZED,
+                DenyReason::Unauthenticated,
+                "unknown or expired halter token",
+            ))),
+        }
+    }
+
+    /// Verify an inbound AWS SigV4 signature against the dummy credential it names, and
+    /// resolve the bound policy. The dummy AKID is the lookup key; the signature is
+    /// recomputed with the stored dummy secret over the request as signed.
+    fn authenticate_sigv4(
+        &self,
+        req: &ProxyRequest,
+        auth: &str,
+        now: u64,
+    ) -> Result<(models::policy::Policy, AuthSource), Box<Outcome>> {
+        let unauth = || {
+            Box::new(reject(
+                http::StatusCode::UNAUTHORIZED,
+                DenyReason::Unauthenticated,
+                "invalid or unknown SigV4 credential",
+            ))
+        };
+        let parsed = crate::sigv4::parse_authorization(auth).ok_or_else(unauth)?;
+        let (policy, secret) = self
+            .control
+            .tokens
+            .resolve_sigv4(&parsed.access_key_id, now)
+            .ok_or_else(unauth)?;
+        let host = extract_host(&req.headers).unwrap_or_default();
+        let amz_date = header_str(&req.headers, "x-amz-date").ok_or_else(unauth)?;
+        let content_sha = header_str(&req.headers, "x-amz-content-sha256").ok_or_else(unauth)?;
+        let valid = crate::sigv4::verify(
+            &secret,
+            &parsed.region,
+            &parsed.service,
+            req.method.as_str(),
+            &host,
+            &req.path,
+            &req.query,
+            &content_sha,
+            &amz_date,
+            &parsed.datestamp,
+            &parsed.signature,
+        );
+        if valid {
+            Ok((policy, AuthSource::SigV4))
+        } else {
+            Err(unauth())
+        }
+    }
+
     /// Authenticate, authorize, and (on allow) plan the upstream forward.
     pub fn handle(&self, req: ProxyRequest) -> Outcome {
         let now = (self.clock)();
 
-        let Some((token, source)) = extract_auth(&req.headers) else {
-            return reject(
-                http::StatusCode::UNAUTHORIZED,
-                DenyReason::Unauthenticated,
-                "missing halter token",
-            );
-        };
-        // The token resolves directly to its bound policy — no agent indirection.
-        let Some(policy) = self.control.tokens.resolve(&token, now) else {
-            return reject(
-                http::StatusCode::UNAUTHORIZED,
-                DenyReason::Unauthenticated,
-                "unknown or expired halter token",
-            );
+        let (policy, source) = match self.authenticate(&req, now) {
+            Ok(v) => v,
+            Err(outcome) => return *outcome,
         };
 
         // Route to a configured service by the request Host. An unmatched host is denied
@@ -455,6 +522,14 @@ fn extract_host(headers: &http::HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A header's value as a `String`, if present and valid UTF-8.
+fn header_str(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 fn reject(status: http::StatusCode, reason: DenyReason, message: &str) -> Outcome {
     Outcome::Reject(Rejection {
         status,
@@ -503,6 +578,9 @@ enum AuthSource {
     /// The token came from `Authorization` itself (e.g. `gh`/`kubectl`, which have only
     /// one auth slot); `Authorization` is the halter token and must not be forwarded.
     Authorization,
+    /// The request was authenticated by an inbound AWS SigV4 signature; the inbound
+    /// `Authorization` and `X-Amz-*` signing headers are halter's to replace on re-sign.
+    SigV4,
 }
 
 /// The halter token from a request's headers, ignoring its source. Used by the
@@ -566,7 +644,14 @@ fn is_dropped_header(name: &http::HeaderName, source: AuthSource) -> bool {
         return true;
     }
     if n == "authorization" {
-        return source == AuthSource::Authorization;
+        // The halter token (Authorization source) and the inbound SigV4 signature (SigV4
+        // source) are both halter's to strip/replace; a HalterHeader token leaves
+        // Authorization as the consumer's own credential.
+        return source != AuthSource::HalterHeader;
+    }
+    // Inbound SigV4 signing headers are replaced by the outbound re-sign.
+    if source == AuthSource::SigV4 && (n == "x-amz-date" || n == "x-amz-content-sha256") {
+        return true;
     }
     HOP_BY_HOP.contains(&n.as_str())
 }
@@ -881,6 +966,123 @@ mod tests {
                 assert!(plan.headers.get("x-amz-content-sha256").is_some());
             }
             Outcome::Reject(_) => panic!("expected forward"),
+        }
+    }
+
+    /// Build a SigV4-signed request the way the AWS CLI would, using `dummy` creds.
+    fn signed_aws_request(
+        akid: &str,
+        secret: &str,
+        host: &str,
+        body: &'static [u8],
+        now: u64,
+    ) -> ProxyRequest {
+        let signed = crate::sigv4::sign(
+            &crate::sigv4::Creds {
+                access_key_id: akid,
+                secret_access_key: secret,
+            },
+            "us-east-1",
+            "ec2",
+            "POST",
+            host,
+            "/",
+            "",
+            body,
+            now,
+        );
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::HOST, host.parse().unwrap());
+        headers.insert(
+            http::header::AUTHORIZATION,
+            signed.authorization.parse().unwrap(),
+        );
+        headers.insert("x-amz-date", signed.amz_date.parse().unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            signed.content_sha256.parse().unwrap(),
+        );
+        ProxyRequest {
+            method: http::Method::POST,
+            path: "/".into(),
+            query: String::new(),
+            headers,
+            body: bytes::Bytes::from_static(body),
+        }
+    }
+
+    fn aws_router() -> ServiceRouter {
+        ServiceRouter::new(vec![Service {
+            name: "ec2".into(),
+            host: "ec2.amazonaws.com".into(),
+            upstream_base: "https://ec2.us-east-1.amazonaws.com".into(),
+            flavor: Flavor::Generic,
+            outbound: Outbound::SigV4 {
+                credential: "aws-secret".into(),
+                access_key_id: "REALAKID".into(),
+                region: "us-east-1".into(),
+                service: "ec2".into(),
+            },
+            address: String::new(),
+            extract: Extract {
+                protocol: crate::service::Protocol::AwsQuery,
+                path_template: None,
+            },
+        }])
+    }
+
+    #[test]
+    fn sigv4_inbound_authenticates_then_resigns_with_real_credential() {
+        let (control, _a, creds) = test_control();
+        creds.insert("aws-secret", Secret::new("real-secret"));
+        let now = 1_700_000_000_000;
+        let gw = Gateway::with_clock(control.clone(), aws_router(), fixed_clock(now));
+        let dummy = control.tokens.mint_sigv4(allow_all(), 60, now);
+        let body = b"Action=DescribeInstances&Version=2016-11-15";
+        let req = signed_aws_request(
+            &dummy.access_key_id,
+            &dummy.secret_access_key,
+            "ec2.amazonaws.com",
+            body,
+            now,
+        );
+        match gw.handle(req) {
+            Outcome::Forward(plan) => {
+                let auth = plan
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                // Re-signed with the REAL access key id; the dummy AKID and real secret
+                // are nowhere in the outbound request.
+                assert!(auth.contains("Credential=REALAKID/"));
+                assert!(!auth.contains(&dummy.access_key_id));
+                assert!(!auth.contains("real-secret"));
+            }
+            Outcome::Reject(r) => panic!("expected forward, got {:?}", r.reason),
+        }
+    }
+
+    #[test]
+    fn sigv4_inbound_bad_signature_is_unauthorized() {
+        let (control, _a, creds) = test_control();
+        creds.insert("aws-secret", Secret::new("real-secret"));
+        let now = 1_700_000_000_000;
+        let gw = Gateway::with_clock(control.clone(), aws_router(), fixed_clock(now));
+        let dummy = control.tokens.mint_sigv4(allow_all(), 60, now);
+        let body = b"Action=DescribeInstances&Version=2016-11-15";
+        // Sign with the wrong secret → signature won't verify against the stored dummy.
+        let req = signed_aws_request(
+            &dummy.access_key_id,
+            "WRONG-SECRET",
+            "ec2.amazonaws.com",
+            body,
+            now,
+        );
+        match gw.handle(req) {
+            Outcome::Reject(r) => assert_eq!(r.reason, DenyReason::Unauthenticated),
+            Outcome::Forward(_) => panic!("expected reject"),
         }
     }
 

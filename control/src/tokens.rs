@@ -16,9 +16,22 @@ use uuid::Uuid;
 struct Entry {
     policy: Policy,
     expires_at_ms: u64,
+    /// For a SigV4 dummy credential, the dummy secret access key (used to verify the
+    /// consumer's inbound signature). `None` for a bearer token.
+    secret: Option<String>,
 }
 
-/// The in-memory token table. Opaque tokens map to `(policy, expiry)`.
+/// A minted dummy AWS SigV4 credential, bound to a policy. The consumer's tooling signs
+/// with it; halter verifies that signature (with [`Tokens::resolve_sigv4`]) and re-signs
+/// the outbound request with the real account credential. Useless against real AWS.
+pub struct SigV4Mint {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub expires_at_ms: u64,
+}
+
+/// The in-memory token table. Keys are either an opaque bearer token or a dummy AWS access
+/// key id; both map to `(policy, expiry, optional secret)`.
 #[derive(Default)]
 pub struct Tokens {
     entries: RwLock<HashMap<String, Entry>>,
@@ -39,12 +52,47 @@ impl Tokens {
             Entry {
                 policy,
                 expires_at_ms,
+                secret: None,
             },
         );
         MintResponse {
             token,
             expires_at_ms,
         }
+    }
+
+    /// Mint a dummy AWS SigV4 credential bound to `policy`. The access key id is the
+    /// lookup key; the secret is stored to verify inbound signatures.
+    pub fn mint_sigv4(&self, policy: Policy, ttl_seconds: u64, now_ms: u64) -> SigV4Mint {
+        let access_key_id = format!("AKIAHALTER{}", &Uuid::new_v4().simple().to_string()[..10])
+            .to_ascii_uppercase();
+        let secret_access_key = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let expires_at_ms = now_ms.saturating_add(ttl_seconds.saturating_mul(1000));
+        self.entries.write().insert(
+            access_key_id.clone(),
+            Entry {
+                policy,
+                expires_at_ms,
+                secret: Some(secret_access_key.clone()),
+            },
+        );
+        SigV4Mint {
+            access_key_id,
+            secret_access_key,
+            expires_at_ms,
+        }
+    }
+
+    /// Resolve a dummy AWS access key id to its bound policy and dummy secret, or `None`
+    /// if unknown, expired, or not a SigV4 credential.
+    pub fn resolve_sigv4(&self, access_key_id: &str, now_ms: u64) -> Option<(Policy, String)> {
+        let entries = self.entries.read();
+        let entry = entries.get(access_key_id)?;
+        if entry.expires_at_ms <= now_ms {
+            return None;
+        }
+        let secret = entry.secret.clone()?;
+        Some((entry.policy.clone(), secret))
     }
 
     /// Resolve a token to its bound policy, or `None` if unknown or expired at `now_ms`.
@@ -99,6 +147,21 @@ mod tests {
     fn unknown_token_resolves_none() {
         let tokens = Tokens::new();
         assert!(tokens.resolve("bogus", 1).is_none());
+    }
+
+    #[test]
+    fn sigv4_mint_resolves_by_access_key_id() {
+        let tokens = Tokens::new();
+        let m = tokens.mint_sigv4(empty_policy(), 60, 1_000);
+        assert!(m.access_key_id.starts_with("AKIAHALTER"));
+        let (_policy, secret) = tokens.resolve_sigv4(&m.access_key_id, 1_000).unwrap();
+        assert_eq!(secret, m.secret_access_key);
+        // Expired and unknown both miss.
+        assert!(tokens.resolve_sigv4(&m.access_key_id, 61_000).is_none());
+        assert!(tokens.resolve_sigv4("AKIAUNKNOWN", 1_000).is_none());
+        // A bearer token is not a SigV4 credential.
+        let bearer = tokens.mint(empty_policy(), 60, 1_000);
+        assert!(tokens.resolve_sigv4(&bearer.token, 1_000).is_none());
     }
 
     #[test]

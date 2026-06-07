@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub use audit::{AuditSink, InMemoryAudit, TracingAudit};
 pub use credentials::{CredentialStore, InMemoryCredentials, Secret};
 pub use tenants::Tenants;
-pub use tokens::Tokens;
+pub use tokens::{SigV4Mint, Tokens};
 
 /// Wall-clock time in Unix epoch milliseconds. The control-plane core takes time as a
 /// parameter for testability; this is the production source the binary passes in.

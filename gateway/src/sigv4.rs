@@ -65,6 +65,49 @@ pub fn sign(
     }
 }
 
+/// A parsed inbound SigV4 `Authorization` header.
+pub struct Parsed {
+    pub access_key_id: String,
+    pub datestamp: String,
+    pub region: String,
+    pub service: String,
+    pub signature: String,
+}
+
+/// Parse an `AWS4-HMAC-SHA256 Credential=AKID/<date>/<region>/<service>/aws4_request,
+/// SignedHeaders=..., Signature=<sig>` header. Returns `None` if malformed.
+pub fn parse_authorization(header: &str) -> Option<Parsed> {
+    let rest = header.strip_prefix("AWS4-HMAC-SHA256")?.trim_start();
+    let mut access_key_id = None;
+    let mut scope: Option<(String, String, String)> = None;
+    let mut signature = None;
+    for part in rest.split(',') {
+        let part = part.trim();
+        if let Some(cred) = part.strip_prefix("Credential=") {
+            let fields: Vec<&str> = cred.splitn(5, '/').collect();
+            let [akid, date, region, service, _terminator] = fields.as_slice() else {
+                continue;
+            };
+            access_key_id = Some((*akid).to_string());
+            scope = Some((
+                (*date).to_string(),
+                (*region).to_string(),
+                (*service).to_string(),
+            ));
+        } else if let Some(sig) = part.strip_prefix("Signature=") {
+            signature = Some(sig.to_string());
+        }
+    }
+    let (datestamp, region, service) = scope?;
+    Some(Parsed {
+        access_key_id: access_key_id?,
+        datestamp,
+        region,
+        service,
+        signature: signature?,
+    })
+}
+
 /// Verify that `signature` matches what `secret_access_key` would produce for this
 /// request (the inbound check against a minted dummy credential). Constant work; compares
 /// the lowercase hex signatures.
@@ -230,6 +273,19 @@ mod tests {
             to_hex(&key),
             "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d"
         );
+    }
+
+    #[test]
+    fn parses_authorization_header() {
+        let h = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231114/us-east-1/ec2/aws4_request, \
+                 SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=abcd1234";
+        let p = parse_authorization(h).unwrap();
+        assert_eq!(p.access_key_id, "AKIDEXAMPLE");
+        assert_eq!(p.datestamp, "20231114");
+        assert_eq!(p.region, "us-east-1");
+        assert_eq!(p.service, "ec2");
+        assert_eq!(p.signature, "abcd1234");
+        assert!(parse_authorization("Bearer xyz").is_none());
     }
 
     #[test]
