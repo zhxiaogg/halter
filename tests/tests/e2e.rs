@@ -35,56 +35,9 @@ const PR_TO_DEVELOP_ONLY: &str = r#"{
     ]
 }"#;
 
-/// User story: a scoped agent reads a repo; halter swaps its token for the real
-/// credential, which the agent never sees.
-#[tokio::test]
-async fn allowed_read_injects_real_credential() {
-    let upstream = start_mock_upstream().await;
-    let halter = start_halter(&upstream.base_url).await;
-    halter.add_credential("github-app", "real-secret-token");
-    let token = halter.mint_token(&policy_from(READ_ONLY), 3600).await;
-
-    let resp = reqwest::Client::new()
-        .get(format!("{}/repos/octocat/hello", halter.proxy_url))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let got = upstream.requests();
-    assert_eq!(got.len(), 1, "upstream should be called exactly once");
-    assert_eq!(got[0].path, "/repos/octocat/hello");
-    // The real secret reached the upstream; the agent's halter token did not.
-    assert_eq!(
-        got[0].authorization.as_deref(),
-        Some("Bearer real-secret-token")
-    );
-    assert!(!got[0].authorization.as_deref().unwrap().contains(&token));
-}
-
-/// User story: a read-only agent's write is denied inline and never reaches GitHub.
-#[tokio::test]
-async fn denied_write_never_reaches_upstream() {
-    let upstream = start_mock_upstream().await;
-    let halter = start_halter(&upstream.base_url).await;
-    halter.add_credential("github-app", "real-secret-token");
-    let token = halter.mint_token(&policy_from(READ_ONLY), 3600).await;
-
-    let resp = reqwest::Client::new()
-        .delete(format!("{}/repos/octocat/hello", halter.proxy_url))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403);
-    assert!(
-        !upstream.was_called(),
-        "denied request must not be forwarded"
-    );
-}
-
 /// User story: finer-than-native control — PRs allowed only against an approved base.
+/// (Basic read-inject and denied-write are covered by `use_cases::github_use_case`; this
+/// keeps the body-condition gating that the use-case suite doesn't exercise.)
 #[tokio::test]
 async fn pr_create_gated_by_base_branch() {
     let upstream = start_mock_upstream().await;

@@ -12,9 +12,11 @@ models     = { workspace = true }
 policy     = { workspace = true }
 control    = { workspace = true }
 gateway    = { workspace = true }
+cli        = { path = "../cli" }
 serde_json = { workspace = true }
 http       = { workspace = true }
 bytes      = { workspace = true }
 axum       = { workspace = true }
 reqwest    = { workspace = true }
 tokio      = { workspace = true }
+tempfile   = { workspace = true }
