@@ -50,14 +50,27 @@ impl ServerState {
     }
 }
 
-/// The proxy router: every method and path is captured and run through the gateway.
+/// The proxy router: every method and path is captured and run through the gateway,
+/// except the reserved `/.halter/` prefix, which halter claims for its own
+/// consumer-facing endpoints before Host-based service routing runs.
+///
+/// `GET /.halter/provision` serves the token-authenticated provision doc on the
+/// agent-facing listener, so a sandboxed consumer whose *only* network egress is this
+/// proxy can self-provision. The admin listener also serves the unauthenticated
+/// `/mint`, so it must never be reachable from a sandbox — provisioning cannot live
+/// only there. Documented tradeoff: a hypothetical upstream path beginning with
+/// `/.halter/` is shadowed by this reservation.
 pub fn proxy_router(state: Arc<ServerState>) -> Router {
-    Router::new().fallback(proxy_handler).with_state(state)
+    Router::new()
+        .route("/.halter/provision", get(provision_handler))
+        .fallback(proxy_handler)
+        .with_state(state)
 }
 
 /// The admin router: `POST /mint` issues a launch token for a submitted policy. Bind
 /// this on a separate, localhost-only listener — it is operator/orchestrator surface,
-/// not agent surface.
+/// not agent surface. `GET /provision` is kept here for back-compat; consumers should
+/// prefer `/.halter/provision` on the proxy listener (see [`proxy_router`]).
 pub fn admin_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/mint", post(mint_handler))
@@ -224,8 +237,11 @@ async fn revoke_handler(
     (StatusCode::OK, Json(RevokeResponse { revoked })).into_response()
 }
 
-/// `GET /provision` — return the consumer-setup bundle for the presented halter token
-/// (in `X-Halter-Token` or `Authorization`). The doc carries no real upstream secrets.
+/// The provision endpoint — return the consumer-setup bundle for the presented halter
+/// token (in `X-Halter-Token` or `Authorization`). The doc carries no real upstream
+/// secrets, and the handler authenticates purely from headers, so the same handler
+/// serves both the proxy listener (`GET /.halter/provision`) and the admin listener
+/// (`GET /provision`, back-compat).
 async fn provision_handler(
     State(state): State<Arc<ServerState>>,
     headers: http::HeaderMap,
