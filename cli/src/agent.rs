@@ -1,6 +1,6 @@
-//! Consumer-side provisioning: fetch the [`ProvisionDoc`] from halter (the reserved
-//! `/.halter/provision` on the proxy listener, or the legacy admin `/provision` — see
-//! [`ProvisionEndpoint`]) and render it into native tool config. [`write_configs`]
+//! Consumer-side provisioning: fetch the [`ProvisionDoc`] from the reserved
+//! `/.halter/provision` path on halter's proxy listener — the only address a sandboxed
+//! consumer can reach — and render it into native tool config. [`write_configs`]
 //! writes everything **under a
 //! caller-supplied home directory** — nothing outside it is touched, so a sandbox (or a
 //! test) can configure stock tools without polluting the host's real `~/.kube`, `~/.aws`,
@@ -22,40 +22,12 @@ const MANIFEST: &str = ".halter/manifest";
 /// Relative path (under the home) of the CA bundle, when halter terminates TLS.
 const CA_BUNDLE: &str = ".halter/halter-ca.pem";
 
-/// Where to fetch the provision doc from. The two halter listeners expose it at
-/// different paths, and the distinction is semantic, not cosmetic: a sandboxed consumer
-/// can only ever reach the proxy listener, while the admin listener (which also serves
-/// the unauthenticated `/mint`) must stay operator-only.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProvisionEndpoint {
-    /// Base URL of the agent-facing proxy listener (e.g. `http://127.0.0.1:9090`).
-    /// Provision lives at the reserved `/.halter/provision` path there.
-    Proxy(String),
-    /// Base URL of the admin API (e.g. `http://127.0.0.1:9091`). Provision lives at the
-    /// legacy `/provision` path; kept for back-compat with pre-proxy-provision servers.
-    Admin(String),
-}
-
-impl ProvisionEndpoint {
-    /// The full URL of the provision doc on this endpoint.
-    fn provision_url(&self) -> String {
-        match self {
-            ProvisionEndpoint::Proxy(base) => {
-                format!("{}/.halter/provision", base.trim_end_matches('/'))
-            }
-            ProvisionEndpoint::Admin(base) => {
-                format!("{}/provision", base.trim_end_matches('/'))
-            }
-        }
-    }
-}
-
-/// Fetch the provision doc from `endpoint`, presenting the token via `X-Halter-Token`.
-pub async fn fetch_provision(
-    endpoint: &ProvisionEndpoint,
-    token: &str,
-) -> Result<ProvisionDoc, String> {
-    let url = endpoint.provision_url();
+/// Fetch the provision doc from the reserved `/.halter/provision` path on the proxy
+/// listener at `proxy_url`, presenting the token via `X-Halter-Token`. The proxy
+/// listener is the only address a sandboxed consumer can reach; the admin listener
+/// (which also serves the unauthenticated `/mint`) stays operator-only.
+pub async fn fetch_provision(proxy_url: &str, token: &str) -> Result<ProvisionDoc, String> {
+    let url = format!("{}/.halter/provision", proxy_url.trim_end_matches('/'));
     let resp = reqwest::Client::new()
         .get(&url)
         .header("X-Halter-Token", token)

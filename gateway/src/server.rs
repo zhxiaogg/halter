@@ -56,10 +56,10 @@ impl ServerState {
 ///
 /// `GET /.halter/provision` serves the token-authenticated provision doc on the
 /// agent-facing listener, so a sandboxed consumer whose *only* network egress is this
-/// proxy can self-provision. The admin listener also serves the unauthenticated
-/// `/mint`, so it must never be reachable from a sandbox — provisioning cannot live
-/// only there. Documented tradeoff: a hypothetical upstream path beginning with
-/// `/.halter/` is shadowed by this reservation.
+/// proxy can self-provision. It lives here and **only** here: the admin listener also
+/// serves the unauthenticated `/mint`, so it must never be reachable from a sandbox.
+/// Documented tradeoff: a hypothetical upstream path beginning with `/.halter/` is
+/// shadowed by this reservation.
 pub fn proxy_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/.halter/provision", get(provision_handler))
@@ -69,13 +69,12 @@ pub fn proxy_router(state: Arc<ServerState>) -> Router {
 
 /// The admin router: `POST /mint` issues a launch token for a submitted policy. Bind
 /// this on a separate, localhost-only listener — it is operator/orchestrator surface,
-/// not agent surface. `GET /provision` is kept here for back-compat; consumers should
-/// prefer `/.halter/provision` on the proxy listener (see [`proxy_router`]).
+/// not agent surface. Provisioning is served only from `/.halter/provision` on the
+/// proxy listener (see [`proxy_router`]).
 pub fn admin_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/mint", post(mint_handler))
         .route("/revoke", post(revoke_handler))
-        .route("/provision", get(provision_handler))
         .with_state(state)
 }
 
@@ -239,9 +238,8 @@ async fn revoke_handler(
 
 /// The provision endpoint — return the consumer-setup bundle for the presented halter
 /// token (in `X-Halter-Token` or `Authorization`). The doc carries no real upstream
-/// secrets, and the handler authenticates purely from headers, so the same handler
-/// serves both the proxy listener (`GET /.halter/provision`) and the admin listener
-/// (`GET /provision`, back-compat).
+/// secrets, and the handler authenticates purely from headers. It is mounted only on
+/// the proxy listener at `GET /.halter/provision` — the one address a sandbox can reach.
 async fn provision_handler(
     State(state): State<Arc<ServerState>>,
     headers: http::HeaderMap,
