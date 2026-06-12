@@ -33,6 +33,27 @@ enum Command {
     Serve(ServeArgs),
     /// Mint a launch token bound to a policy file, via a running server's admin API.
     Mint(MintArgs),
+    /// Inspect the policy vocabulary built into this binary (no server needed).
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogCommand {
+    /// List every flavor's operations, resource kinds, and conditionable fields.
+    List(CatalogListArgs),
+}
+
+#[derive(clap::Args)]
+struct CatalogListArgs {
+    /// Only this flavor (e.g. "github").
+    #[arg(long)]
+    flavor: Option<String>,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args)]
@@ -67,7 +88,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
         Command::Serve(args) => serve(args).await,
         Command::Mint(args) => mint(args).await,
+        Command::Catalog {
+            command: CatalogCommand::List(args),
+        } => catalog_list(&args),
     }
+}
+
+/// Print the built-in flavor catalogs — the discoverable policy vocabulary. Reads only
+/// the compiled-in registry, so it works offline with no server or config.
+fn catalog_list(args: &CatalogListArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let catalogs: Vec<_> = match args.flavor.as_deref() {
+        Some(name) => {
+            let flavor = flavors::by_name(name)
+                .ok_or_else(|| flavors::UnknownFlavor(name.to_string()).to_string())?;
+            vec![flavor.catalog().clone()]
+        }
+        None => flavors::registry()
+            .iter()
+            .map(|f| f.catalog().clone())
+            .collect(),
+    };
+    if args.json {
+        println!("{}", hackamore_cli::render::catalogs_json(&catalogs)?);
+    } else {
+        print!("{}", hackamore_cli::render::catalogs_human(&catalogs));
+    }
+    Ok(())
 }
 
 /// Build the control plane and gateway from config, then serve until shutdown.
