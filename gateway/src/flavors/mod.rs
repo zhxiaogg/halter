@@ -106,4 +106,78 @@ mod tests {
         let names: std::collections::BTreeSet<&str> = registry().iter().map(|f| f.name()).collect();
         assert_eq!(names.len(), registry().len());
     }
+
+    /// Instantiate a route template with dummy concrete segments: `{name}` → "x", a
+    /// trailing `{name+}` → "x/y", literals kept — a representative request path.
+    fn instantiate(template: &str) -> String {
+        template
+            .split('/')
+            .map(
+                |seg| match seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+                    Some(name) if name.ends_with('+') => "x/y",
+                    Some(_) => "x",
+                    None => seg,
+                },
+            )
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The no-drift invariant: every published operation, walked through the flavor's
+    /// *real* `resource()`, yields the catalog's resource kind. A catalog entry that
+    /// disagrees with the normalizer cannot ship.
+    #[test]
+    fn catalog_kinds_agree_with_the_normalizer() {
+        for flavor in registry() {
+            for op in &flavor.catalog().operations {
+                let path = instantiate(&op.route.path_template);
+                assert_eq!(
+                    flavor.resource(&path).kind,
+                    op.resource_kind,
+                    "{}: op '{}' catalog kind drifted from resource({path})",
+                    flavor.name(),
+                    op.id,
+                );
+            }
+        }
+    }
+
+    /// The published verb must be exactly what the REST method mapping produces for the
+    /// operation's route method.
+    #[test]
+    fn catalog_verbs_agree_with_the_method_mapping() {
+        for flavor in registry() {
+            for op in &flavor.catalog().operations {
+                let method = http::Method::from_bytes(op.route.method.as_str().as_bytes())
+                    .expect("catalog method is a valid HTTP method");
+                assert_eq!(
+                    crate::normalize::verb_for(&method),
+                    op.verb,
+                    "{}: op '{}' catalog verb drifted from the {} mapping",
+                    flavor.name(),
+                    op.id,
+                    op.route.method.as_str(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_ids_are_unique_and_flavor_names_match() {
+        for flavor in registry() {
+            let catalog = flavor.catalog();
+            assert_eq!(catalog.flavor, flavor.name());
+            let ids: std::collections::BTreeSet<&str> =
+                catalog.operations.iter().map(|o| o.id.as_str()).collect();
+            assert_eq!(ids.len(), catalog.operations.len(), "{}", flavor.name());
+        }
+    }
+
+    #[test]
+    fn github_and_k8s_catalogs_are_non_empty() {
+        assert!(!GITHUB.catalog().operations.is_empty());
+        assert!(!K8S.catalog().operations.is_empty());
+        // generic is deliberately raw.
+        assert!(GENERIC.catalog().operations.is_empty());
+    }
 }
