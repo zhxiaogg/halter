@@ -1,0 +1,71 @@
+/// The machine-readable vocabulary of one flavor: every operation policies can be
+/// written about, with its verb, route shape, resource kind, and the request fields
+/// conditional rules can reference. Served to discovery tooling (`hackamore catalog
+/// list`, the web UI) and consumed by policy lint — the single source of truth a
+/// policy author works from.
+package catalog;
+
+use action.Verb;
+
+/// The HTTP methods catalog routes are written against (the canonical operation
+/// spellings; HEAD/OPTIONS normalize like GET and are not catalogued).
+enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+/// Where a conditionable field comes from in the request.
+enum FieldSource {
+    /// Captured from a path template segment.
+    Path,
+    /// A query-string parameter.
+    Query,
+    /// A key in the JSON (or form) request body.
+    Body,
+}
+
+/// One request attribute an operation exposes to conditional rules.
+struct FieldSpec {
+    /// The key as it appears in `Action.fields` (dotted paths allowed, e.g. "head.ref").
+    name: String,
+    source: FieldSource,
+    /// One-line human description.
+    summary: String,
+}
+
+/// The route shape of an operation: method + path template. Template segments are
+/// literals or `{name}` captures; a trailing `{name+}` captures the path remainder.
+struct Route {
+    method: HttpMethod,
+    /// Slash-joined, no leading slash, e.g. "repos/{owner}/{repo}/pulls".
+    path_template: String,
+}
+
+/// One operation a policy can allow or deny: what the normalizer turns a matching
+/// request into (verb + resource kind), and which fields it extracts.
+struct Operation {
+    /// Stable id, e.g. "pulls.create".
+    id: String,
+    /// The verb the normalizer produces for this operation.
+    verb: Verb,
+    route: Route,
+    /// The `Resource.kind` the normalizer produces, e.g. "pull_request".
+    resource_kind: String,
+    /// Conditionable request fields this operation carries. Not exhaustive — the
+    /// normalizer forwards every body/query key — but the documented, curated set.
+    fields: Vec<FieldSpec>,
+    /// One-line human description.
+    summary: String,
+}
+
+/// A flavor's full vocabulary. An empty `operations` list means the flavor is raw /
+/// undocumented (e.g. `generic`): discovery has nothing to show and lint skips
+/// catalog-derived checks.
+struct Catalog {
+    /// The flavor name this catalog belongs to, e.g. "github".
+    flavor: String,
+    operations: Vec<Operation>,
+}
