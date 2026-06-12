@@ -310,7 +310,8 @@ mod tests {
         assert!(!super::lint::Finding::warning(0, "looks odd").is_error());
         let json = serde_json::to_value(&f).unwrap();
         assert_eq!(json["severity"], "Error");
-        assert_eq!(json["rule_index"], 2);
+        // Fluorite structs serialize camelCase on the wire.
+        assert_eq!(json["ruleIndex"], 2);
         let back: super::lint::Finding = serde_json::from_value(json).unwrap();
         assert_eq!(f, back);
     }
