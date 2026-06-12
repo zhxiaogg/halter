@@ -5,7 +5,7 @@ members = [
     "control",
     "gateway",
     "cli",
-    "hackamore-agent",
+    "agent",
     "tests",
 ]
 resolver = "2"
@@ -21,7 +21,7 @@ models       = { path = "models" }
 policy       = { path = "policy" }
 control      = { path = "control" }
 gateway      = { path = "gateway" }
-hackamore-agent = { path = "hackamore-agent" }
+hackamore-agent = { path = "agent" }
 
 # Protocol codegen
 fluorite         = "0.6.0"
