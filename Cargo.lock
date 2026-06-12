@@ -592,11 +592,13 @@ dependencies = [
 name = "hackamore"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "hackamore-control",
  "hackamore-gateway",
  "hackamore-models",
  "hackamore-policy",
+ "http",
  "reqwest",
  "serde",
  "serde_json",
