@@ -1,7 +1,10 @@
 # hackamore usability: formalized catalogs, policy tooling, web UI, pluggable flavors
 
 **Date:** 2026-06-12
-**Status:** Approved
+**Status:** Approved — amended 2026-06-12 during phase-1 implementation: catalog/normalizer
+agreement is enforced by invariant tests rather than a catalog-interpreting default
+`normalize` (see §1); the pre-existing named-action `Catalog` in the gateway was renamed
+`ActionCatalog` to free the name.
 
 ## Problem
 
@@ -55,32 +58,29 @@ A flavor becomes a first-class abstraction, replacing the hand-rolled flavor `ma
 in `normalize.rs`:
 
 ```rust
-pub trait Flavor: Send + Sync {
+pub trait Flavor: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &'static str;
     fn catalog(&self) -> &Catalog;
-    fn normalize(&self, input: &NormalizeInput) -> Action {
-        catalog_normalize(self.catalog(), input)
-    }
+    fn resource(&self, path: &str) -> Resource;
 }
 ```
 
 - Built-in flavors (`github`, `k8s`, `generic`) register in a static, compile-time
   registry. Config `"flavor": "github"` resolves through the registry; an unknown
-  flavor name is a **startup error** (fail closed).
-- The default `normalize` is implemented generically over the catalog: route
-  matching via the existing `capture_path_template` machinery, verb/kind/fields
-  taken from the matched `Operation`. For most flavors the catalog is therefore the
-  single source of truth — catalog and normalizer cannot drift.
-- A flavor overrides `normalize` only when it needs custom code (e.g. AWS
-  query/json operation extraction from `Action=` body params or `X-Amz-Target`
-  headers). Protocol quirks stay in code; vocabulary stays in data.
-- A request that matches no catalog route falls through to the flavor's documented
-  fallback (today's generic path/kind derivation), preserving fail-closed behavior:
-  unmatched requests still normalize to *something* the policy engine sees, and
-  default-deny applies.
-- The current GitHub flavor logic is translated into catalog entries. Parity tests
-  pin the existing behavior: a golden set of (request → Action) cases asserted
-  against both the old and new normalizers during the refactor.
+  flavor name is a **startup error** (fail closed). Absent flavor = generic, as today.
+- **Amended:** the flavor hook is `resource()` (path → kind), not a full `normalize`
+  override — verb and field extraction are protocol concerns (`Protocol::Rest` /
+  `AwsQuery` / `AwsJson`) shared by all flavors and they stay in `normalize.rs`.
+  Resource derivation stays as flavor *code* (moved verbatim from `normalize.rs`,
+  exact parity), and no-drift between catalog and normalizer is guaranteed by
+  **invariant tests** instead of a catalog interpreter: every catalog operation's
+  route template is instantiated with dummy segments and walked through the flavor's
+  real `resource()` (kind must match) and through the real method→verb mapping (verb
+  must match). A catalog entry that disagrees with the data plane cannot ship.
+- Unmatched requests keep today's behavior unchanged — each flavor's `resource()`
+  handles every path (fail-closed default-deny applies as before).
+- The existing normalize unit tests serve as the parity pins; they were not modified
+  beyond flavor-reference spelling.
 
 ### 2. `Catalog` schema (`hackamore-models`, fluorite)
 

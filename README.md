@@ -80,10 +80,16 @@ named in the policy**: each service instance owns its credential and outbound st
 (`passthrough` to forward the consumer's own credential, or `{ "inject": "<id>" }` to swap
 in the real one).
 
+The vocabulary a policy is written against (verbs, resource kinds, route shapes, and
+the fields conditions can reference) is published per flavor — run
+`hackamore catalog list` to browse it offline.
+
 ## Quickstart
 
 ```bash
 make build
+# discover what policies can say (flavors, operations, resource kinds, fields)
+cargo run -p cli --bin hackamore -- catalog list
 # edit examples/config.json: set a real credential and your agents' policies
 make run                      # serves proxy on :9090, admin API on :9091
 
