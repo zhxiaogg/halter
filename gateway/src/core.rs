@@ -155,7 +155,8 @@ impl Gateway {
     fn validate_catalog(&self, policy: &hackamore_models::policy::Policy) -> Result<(), MintError> {
         use hackamore_models::action::Verb;
         use hackamore_models::policy::Effect;
-        let nonempty: Vec<&ActionCatalog> = self.catalogs.values().filter(|c| !c.is_empty()).collect();
+        let nonempty: Vec<&ActionCatalog> =
+            self.catalogs.values().filter(|c| !c.is_empty()).collect();
         for rule in &policy.rules {
             if rule.effect != Effect::Allow {
                 continue;
@@ -791,7 +792,8 @@ fn is_dropped_header(name: &http::HeaderName, source: AuthSource) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::service::{Extract, Flavor, Service, ServiceRouter};
+    use crate::flavors;
+    use crate::service::{Extract, Service, ServiceRouter};
     use hackamore_control::{InMemoryAudit, Secret};
     use hackamore_models::policy::{Effect, Match, Policy, Rule};
 
@@ -813,7 +815,7 @@ mod tests {
     fn router() -> ServiceRouter {
         ServiceRouter::new(vec![
             Service::new("github", "*", "https://api.github.com")
-                .with_flavor(Flavor::Github)
+                .with_flavor(&flavors::GITHUB)
                 .with_outbound(Outbound::Bearer {
                     credential: "github-app".into(),
                 }),
@@ -1237,7 +1239,7 @@ mod tests {
     fn two_service_router() -> ServiceRouter {
         ServiceRouter::new(vec![
             Service::new("github", "api.github.com", "https://api.github.com")
-                .with_flavor(Flavor::Github)
+                .with_flavor(&flavors::GITHUB)
                 .with_outbound(Outbound::Bearer {
                     credential: "github-app".into(),
                 })
@@ -1341,7 +1343,10 @@ mod tests {
         use crate::service::ActionCatalog;
         let (control, _a, _) = test_control();
         let mut catalogs = std::collections::HashMap::new();
-        catalogs.insert("github".to_string(), ActionCatalog::of(["repo:read".to_string()]));
+        catalogs.insert(
+            "github".to_string(),
+            ActionCatalog::of(["repo:read".to_string()]),
+        );
         let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000))
             .with_catalogs(catalogs);
 

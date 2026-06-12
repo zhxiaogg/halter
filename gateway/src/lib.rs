@@ -8,6 +8,7 @@
 
 pub mod canonicalize;
 pub mod core;
+pub mod flavors;
 pub mod normalize;
 pub mod server;
 pub mod service;
@@ -16,6 +17,7 @@ pub mod tls;
 pub mod upgrade;
 
 pub use core::{ForwardPlan, Gateway, MintError, Outcome, ProxyRequest, Rejection};
+pub use flavors::Flavor;
 pub use server::{ServerState, admin_router, proxy_router, serve};
-pub use service::{ActionCatalog, Extract, Flavor, Outbound, Protocol, Service, ServiceRouter};
+pub use service::{ActionCatalog, Extract, Outbound, Protocol, Service, ServiceRouter};
 pub use tls::TlsMaterial;

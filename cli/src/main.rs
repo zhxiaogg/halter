@@ -9,7 +9,8 @@ use clap::{Parser, Subcommand};
 use hackamore_cli::config::{Config, OutboundConfig};
 use hackamore_control::{ControlPlane, InMemoryCredentials, Secret, TracingAudit};
 use hackamore_gateway::{
-    ActionCatalog, Extract, Flavor, Gateway, Outbound, Protocol, Service, ServiceRouter, TlsMaterial,
+    ActionCatalog, Extract, Gateway, Outbound, Protocol, Service, ServiceRouter, TlsMaterial,
+    flavors,
 };
 use hackamore_models::control::{MintRequest, MintResponse};
 use hackamore_models::policy::Policy;
@@ -79,14 +80,15 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     for (key, targets) in &cfg.tenants {
         control.tenants.insert(key.clone(), targets.iter().cloned());
     }
-    let services: Vec<Service> = cfg
-        .services
-        .iter()
-        .map(|s| Service {
+    let mut services: Vec<Service> = Vec::with_capacity(cfg.services.len());
+    for s in &cfg.services {
+        services.push(Service {
             name: s.name.clone(),
             host: s.host.clone(),
             upstream_base: s.upstream_base.clone(),
-            flavor: Flavor::parse(s.flavor.as_deref()),
+            // Fail closed: a typoed flavor must not silently downgrade to generic parsing.
+            flavor: flavors::resolve(s.flavor.as_deref())
+                .map_err(|e| format!("service '{}': {e}", s.name))?,
             outbound: match &s.outbound {
                 OutboundConfig::Passthrough => Outbound::Passthrough,
                 OutboundConfig::Bearer(id) => Outbound::Bearer {
@@ -113,8 +115,8 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 protocol: Protocol::parse(s.protocol.as_deref()),
                 path_template: s.path_template.clone(),
             },
-        })
-        .collect();
+        });
+    }
     tracing::info!(
         credentials = cfg.credentials.len(),
         services = services.len(),

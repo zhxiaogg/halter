@@ -2,7 +2,7 @@
 //! exercise: SSE streaming relay and fail-closed Host routing. (Per-service injection and
 //! AWS-query action gating live in `use_cases.rs`.)
 
-use hackamore_gateway::{Flavor, Outbound, Service};
+use hackamore_gateway::{Flavor, Outbound, Service, flavors};
 use hackamore_models::policy::Policy;
 use hackamore_tests::{
     start_hackamore_services, start_hackamore_tls_services, start_mock_upstream,
@@ -17,7 +17,13 @@ fn allow_all() -> Policy {
     .expect("valid policy")
 }
 
-fn service(name: &str, host: &str, flavor: Flavor, credential: &str, upstream: &str) -> Service {
+fn service(
+    name: &str,
+    host: &str,
+    flavor: &'static dyn Flavor,
+    credential: &str,
+    upstream: &str,
+) -> Service {
     Service::new(name, host, upstream)
         .with_flavor(flavor)
         .with_outbound(Outbound::Bearer {
@@ -33,7 +39,7 @@ async fn sse_stream_is_relayed() {
     let hackamore = start_hackamore_services(vec![service(
         "events",
         "*",
-        Flavor::Generic,
+        &flavors::GENERIC,
         "svc-key",
         &upstream.base_url,
     )])
@@ -75,7 +81,7 @@ async fn tls_terminated_proxy_serves_https_and_publishes_ca() {
         vec![service(
             "svc",
             "*",
-            Flavor::Generic,
+            &flavors::GENERIC,
             "svc-key",
             &upstream.base_url,
         )],
@@ -128,7 +134,7 @@ async fn allowed_upgrade_is_tunneled_to_upstream() {
     let hackamore = start_hackamore_services(vec![service(
         "svc",
         "*",
-        Flavor::Generic,
+        &flavors::GENERIC,
         "svc-key",
         &upstream.base_url,
     )])
@@ -186,7 +192,7 @@ async fn unrouted_host_is_denied() {
     let hackamore = start_hackamore_services(vec![service(
         "github",
         "api.github.com",
-        Flavor::Github,
+        &flavors::GITHUB,
         "github-app",
         &upstream.base_url,
     )])

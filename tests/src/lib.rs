@@ -7,7 +7,7 @@
 use axum::Router;
 use axum::extract::State;
 use hackamore_control::{ControlPlane, InMemoryAudit, InMemoryCredentials, Secret};
-use hackamore_gateway::{Flavor, Gateway, Outbound, ServerState, Service, ServiceRouter};
+use hackamore_gateway::{Gateway, Outbound, ServerState, Service, ServiceRouter, flavors};
 use hackamore_models::policy::Policy;
 use std::sync::{Arc, Mutex};
 
@@ -171,7 +171,7 @@ impl Harness {
 pub async fn start_hackamore(upstream_base: &str) -> Harness {
     start_hackamore_services(vec![
         Service::new("github", "*", upstream_base)
-            .with_flavor(Flavor::Github)
+            .with_flavor(&flavors::GITHUB)
             .with_outbound(Outbound::Bearer {
                 credential: "github-app".to_string(),
             }),
