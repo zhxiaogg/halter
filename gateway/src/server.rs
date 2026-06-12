@@ -222,6 +222,16 @@ async fn mint_handler(
         .mint_checked(req.policy, req.ttl_seconds, tenant)
     {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        // A lint rejection carries structured findings so the author (or the web UI) can
+        // see every problem at once, not just the first.
+        Err(crate::core::MintError::PolicyLint(findings)) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "policy failed lint",
+                "findings": findings,
+            })),
+        )
+            .into_response(),
         Err(err) => error_response(StatusCode::FORBIDDEN, &err.to_string()),
     }
 }
