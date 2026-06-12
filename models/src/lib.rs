@@ -38,6 +38,11 @@ pub mod catalog {
     include!(concat!(env!("OUT_DIR"), "/catalog/mod.rs"));
 }
 
+#[allow(clippy::doc_markdown, clippy::too_many_arguments)]
+pub mod lint {
+    include!(concat!(env!("OUT_DIR"), "/lint/mod.rs"));
+}
+
 /// An empty `fields` JSON object — the default when a request carries no query or body
 /// attributes relevant to conditional rules.
 pub fn empty_fields() -> serde_json::Value {
@@ -204,6 +209,31 @@ impl catalog::Catalog {
     }
 }
 
+impl lint::Finding {
+    /// An `Error` finding: the rule can never do what its author meant; rejects a mint.
+    pub fn error(rule_index: usize, message: impl Into<String>) -> Self {
+        Self {
+            severity: lint::Severity::Error,
+            rule_index: rule_index as u64,
+            message: message.into(),
+        }
+    }
+
+    /// A `Warning` finding: passes lint but deserves a look.
+    pub fn warning(rule_index: usize, message: impl Into<String>) -> Self {
+        Self {
+            severity: lint::Severity::Warning,
+            rule_index: rule_index as u64,
+            message: message.into(),
+        }
+    }
+
+    /// Whether this finding rejects a mint.
+    pub fn is_error(&self) -> bool {
+        self.severity == lint::Severity::Error
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -271,6 +301,18 @@ mod tests {
         let back: Catalog = serde_json::from_value(json).unwrap();
         assert_eq!(catalog, back);
         assert_eq!(HttpMethod::Post.as_str(), "POST");
+    }
+
+    #[test]
+    fn finding_constructors_and_json_shape() {
+        let f = super::lint::Finding::error(2, "rule 2 can never match");
+        assert!(f.is_error());
+        assert!(!super::lint::Finding::warning(0, "looks odd").is_error());
+        let json = serde_json::to_value(&f).unwrap();
+        assert_eq!(json["severity"], "Error");
+        assert_eq!(json["rule_index"], 2);
+        let back: super::lint::Finding = serde_json::from_value(json).unwrap();
+        assert_eq!(f, back);
     }
 
     #[test]
