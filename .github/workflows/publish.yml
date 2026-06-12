@@ -1,0 +1,29 @@
+name: Publish
+
+# Publish every workspace crate to crates.io, in dependency order, when a
+# version tag is pushed. Requires the CARGO_REGISTRY_TOKEN repo secret
+# (a crates.io API token with publish-new + publish-update scope).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `--workspace` resolves the inter-crate publish order automatically and
+      # skips publish = false members (tests). `--locked` guards against the
+      # lockfile drifting from what CI tested.
+      - name: cargo publish
+        run: cargo publish --workspace --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
