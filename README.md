@@ -39,7 +39,7 @@ can be reused by any proxy (an Envoy `ext_authz` adapter, a hudsucker MITM, …)
  sandboxed agent ──(only egress)──▶ hackamore reverse proxy ──▶ any configured HTTPS service
    gh / git / sdk / curl             │  route by Host → service        (GitHub, OpenAI, …)
    Authorization: <hackamore token>     │  normalize → Action
-                                     │  policy::decide(Action) → Verdict
+                                     │  hackamore_policy::decide(Action) → Verdict
                                      │  inject real credential, strip hackamore token
                                      │  stream response (HTTP / SSE)
                                      ▼
@@ -48,12 +48,12 @@ can be reused by any proxy (an Envoy `ext_authz` adapter, a hudsucker MITM, …)
 
 | Crate | Role |
 |-------|------|
-| `models` | fluorite-generated contract types: `Action`, `Verdict`, `Policy`, audit + mint wire types |
-| `policy` | the **reusable engine** — pure `decide(&Action, &Policy) -> Verdict`, no I/O |
-| `control` | control plane: agent→policy registry, token minting, credential vault, audit sink |
-| `gateway` | data plane: Host router + service allowlist, request→`Action` normalizer (generic + flavors), decision/enforcement core, streaming reverse proxy |
-| `cli` | the `hackamore` binary: `serve` + `mint` |
-| `tests` | full-stack e2e tests (mock GitHub upstream + live server) |
+| `hackamore-models` | fluorite-generated contract types: `Action`, `Verdict`, `Policy`, audit + mint wire types |
+| `hackamore-policy` | the **reusable engine** — pure `decide(&Action, &Policy) -> Verdict`, no I/O |
+| `hackamore-control` | control plane: agent→policy registry, token minting, credential vault, audit sink |
+| `hackamore-gateway` | data plane: Host router + service allowlist, request→`Action` normalizer (generic + flavors), decision/enforcement core, streaming reverse proxy |
+| `hackamore-cli` | the `hackamore` binary: `serve` + `mint` |
+| `hackamore-tests` | full-stack e2e tests (mock GitHub upstream + live server) |
 
 The `Action`/`Verdict` contract is the portability boundary: the engine never sees HTTP,
 only a normalized `Action`, so a future K8s or Envoy adapter reuses it unchanged.

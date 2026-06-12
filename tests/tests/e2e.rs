@@ -2,8 +2,8 @@
 //! mock GitHub upstream, driven over HTTP exactly as a sandboxed agent's `gh`/`git`
 //! would drive it. Each test asserts one user story end to end.
 
-use models::policy::Policy;
-use tests::{start_hackamore, start_mock_upstream};
+use hackamore_models::policy::Policy;
+use hackamore_tests::{start_hackamore, start_mock_upstream};
 
 fn policy_from(json: &str) -> Policy {
     serde_json::from_str(json).expect("valid policy json")
@@ -359,6 +359,6 @@ async fn decisions_are_audited() {
 
     let events = hackamore.audit.events();
     assert_eq!(events.len(), 2, "one audit record per decision");
-    assert_eq!(events[0].decision, models::audit::Decision::Allow);
-    assert_eq!(events[1].decision, models::audit::Decision::Deny);
+    assert_eq!(events[0].decision, hackamore_models::audit::Decision::Allow);
+    assert_eq!(events[1].decision, hackamore_models::audit::Decision::Deny);
 }

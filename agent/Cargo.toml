@@ -14,7 +14,7 @@ name = "hackamore-agent"
 path = "src/main.rs"
 
 [dependencies]
-models     = { workspace = true }
+hackamore-models = { workspace = true }
 reqwest    = { workspace = true }
 clap       = { workspace = true }
 tokio      = { workspace = true }

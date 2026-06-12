@@ -13,7 +13,7 @@
 //! ([`ProvisionDoc::hackamore_ca`]); it is written once and referenced by path from every
 //! tool's config (kubeconfig, `~/.aws/config`, `.gitconfig`).
 
-use models::provision::{ProvisionAuth, ProvisionDoc, ProvisionMode, ProvisionService};
+use hackamore_models::provision::{ProvisionAuth, ProvisionDoc, ProvisionMode, ProvisionService};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -245,7 +245,7 @@ fn write_github(
 fn write_aws(
     home: &Path,
     s: &ProvisionService,
-    a: &models::provision::SigV4Auth,
+    a: &hackamore_models::provision::SigV4Auth,
     ca: Option<&Path>,
 ) -> std::io::Result<Vec<PathBuf>> {
     let creds = format!(
@@ -313,7 +313,7 @@ fn write(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use models::provision::{BearerAuth, SigV4Auth};
+    use hackamore_models::provision::{BearerAuth, SigV4Auth};
 
     fn svc(
         target: &str,

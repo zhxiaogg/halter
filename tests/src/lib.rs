@@ -6,9 +6,9 @@
 
 use axum::Router;
 use axum::extract::State;
-use control::{ControlPlane, InMemoryAudit, InMemoryCredentials, Secret};
-use gateway::{Flavor, Gateway, Outbound, ServerState, Service, ServiceRouter};
-use models::policy::Policy;
+use hackamore_control::{ControlPlane, InMemoryAudit, InMemoryCredentials, Secret};
+use hackamore_gateway::{Flavor, Gateway, Outbound, ServerState, Service, ServiceRouter};
+use hackamore_models::policy::Policy;
 use std::sync::{Arc, Mutex};
 
 /// One request the mock upstream received.
@@ -184,7 +184,7 @@ pub async fn start_hackamore(upstream_base: &str) -> Harness {
 /// plaintext. The returned `proxy_url` is `https://…`.
 pub async fn start_hackamore_tls_services(
     services: Vec<Service>,
-    tls: gateway::TlsMaterial,
+    tls: hackamore_gateway::TlsMaterial,
 ) -> Harness {
     let credentials = Arc::new(InMemoryCredentials::new());
     let audit = Arc::new(InMemoryAudit::new());
@@ -200,15 +200,15 @@ pub async fn start_hackamore_tls_services(
 
     let proxy_state = state.clone();
     tokio::spawn(async move {
-        let _ = gateway::server::serve_proxy_tls(
+        let _ = hackamore_gateway::server::serve_proxy_tls(
             proxy_listener,
-            gateway::proxy_router(proxy_state),
+            hackamore_gateway::proxy_router(proxy_state),
             config,
         )
         .await;
     });
     tokio::spawn(async move {
-        let _ = axum::serve(admin_listener, gateway::admin_router(state)).await;
+        let _ = axum::serve(admin_listener, hackamore_gateway::admin_router(state)).await;
     });
 
     Harness {
@@ -235,10 +235,10 @@ pub async fn start_hackamore_services(services: Vec<Service>) -> Harness {
 
     let proxy_state = state.clone();
     tokio::spawn(async move {
-        let _ = axum::serve(proxy_listener, gateway::proxy_router(proxy_state)).await;
+        let _ = axum::serve(proxy_listener, hackamore_gateway::proxy_router(proxy_state)).await;
     });
     tokio::spawn(async move {
-        let _ = axum::serve(admin_listener, gateway::admin_router(state)).await;
+        let _ = axum::serve(admin_listener, hackamore_gateway::admin_router(state)).await;
     });
 
     Harness {

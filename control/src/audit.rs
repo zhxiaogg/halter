@@ -2,7 +2,7 @@
 //! trait lets the data plane stay oblivious to where records go; v1 ships an in-memory
 //! sink (used by tests and introspection) and a `tracing` sink for operations.
 
-use models::audit::AuditEvent;
+use hackamore_models::audit::AuditEvent;
 use parking_lot::{Mutex, RwLock};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -112,8 +112,8 @@ impl AuditSink for FileAudit {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use models::action::{Action, CrudKind, Resource, Verb};
-    use models::audit::Decision;
+    use hackamore_models::action::{Action, CrudKind, Resource, Verb};
+    use hackamore_models::audit::Decision;
 
     fn event(at: u64, decision: Decision, detail: &str) -> AuditEvent {
         AuditEvent {

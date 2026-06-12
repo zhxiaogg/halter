@@ -2,7 +2,7 @@
 //!
 //! [`Gateway::handle`] takes a normalized [`ProxyRequest`], authenticates the hackamore
 //! token and resolves its bound policy, normalizes the request into an `Action`, calls
-//! the pure [`policy::decide`], records an audit event, and returns an [`Outcome`] —
+//! the pure [`hackamore_policy::decide`], records an audit event, and returns an [`Outcome`] —
 //! either a [`ForwardPlan`] (with the matched service's outbound stance applied) or a
 //! [`Rejection`]. It performs no network I/O itself; the server module executes the
 //! forward. Keeping this layer free of HTTP plumbing makes the whole decision path
@@ -10,10 +10,10 @@
 
 use crate::service::{Catalog, Outbound, Service, ServiceRouter};
 use crate::{canonicalize, normalize};
-use control::{ControlPlane, now_ms};
-use models::action::Action;
-use models::audit::{AuditEvent, Decision};
-use models::verdict::{DenyReason, Verdict};
+use hackamore_control::{ControlPlane, now_ms};
+use hackamore_models::action::Action;
+use hackamore_models::audit::{AuditEvent, Decision};
+use hackamore_models::verdict::{DenyReason, Verdict};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -112,9 +112,9 @@ impl Gateway {
     /// identity (multi-tenant caller-authorization, when added, gates this earlier).
     pub fn mint(
         &self,
-        policy: models::policy::Policy,
+        policy: hackamore_models::policy::Policy,
         ttl_seconds: u64,
-    ) -> models::control::MintResponse {
+    ) -> hackamore_models::control::MintResponse {
         self.control
             .tokens
             .mint(policy, ttl_seconds, (self.clock)())
@@ -126,10 +126,10 @@ impl Gateway {
     /// fail closed, closing the credential-laundering hole.
     pub fn mint_checked(
         &self,
-        policy: models::policy::Policy,
+        policy: hackamore_models::policy::Policy,
         ttl_seconds: u64,
         tenant: Option<&str>,
-    ) -> Result<models::control::MintResponse, MintError> {
+    ) -> Result<hackamore_models::control::MintResponse, MintError> {
         if !self.control.tenants.is_empty() {
             let key = tenant.ok_or(MintError::MissingTenant)?;
             let owned = self
@@ -152,9 +152,9 @@ impl Gateway {
     /// each named target's catalog; an **empty-target** (any-service) allow rule — which the
     /// old check skipped entirely — must have its named action known by *at least one*
     /// configured catalog, so a typo can't slip through on the broadest rule of all.
-    fn validate_catalog(&self, policy: &models::policy::Policy) -> Result<(), MintError> {
-        use models::action::Verb;
-        use models::policy::Effect;
+    fn validate_catalog(&self, policy: &hackamore_models::policy::Policy) -> Result<(), MintError> {
+        use hackamore_models::action::Verb;
+        use hackamore_models::policy::Effect;
         let nonempty: Vec<&Catalog> = self.catalogs.values().filter(|c| !c.is_empty()).collect();
         for rule in &policy.rules {
             if rule.effect != Effect::Allow {
@@ -206,10 +206,10 @@ impl Gateway {
     /// policy ⋈ the service registry. Returns `None` for an unknown/expired token. The
     /// doc carries no real upstream secrets — only the token, endpoints, and (later) the
     /// CA.
-    pub fn provision(&self, token: &str) -> Option<models::provision::ProvisionDoc> {
+    pub fn provision(&self, token: &str) -> Option<hackamore_models::provision::ProvisionDoc> {
         let now = (self.clock)();
         let (policy, expires_at_ms) = self.control.tokens.resolve_full(token, now)?;
-        Some(models::provision::ProvisionDoc {
+        Some(hackamore_models::provision::ProvisionDoc {
             hackamore_token: token.to_string(),
             hackamore_ca: self.hackamore_ca.clone(),
             expires_at_ms,
@@ -225,11 +225,11 @@ impl Gateway {
     fn provisionable_services(
         &self,
         token: &str,
-        policy: &models::policy::Policy,
+        policy: &hackamore_models::policy::Policy,
         now: u64,
         expires_at_ms: u64,
-    ) -> Vec<models::provision::ProvisionService> {
-        use models::policy::Effect;
+    ) -> Vec<hackamore_models::provision::ProvisionService> {
+        use hackamore_models::policy::Effect;
         let mut any_target = false;
         let mut named: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for rule in &policy.rules {
@@ -253,7 +253,7 @@ impl Gateway {
                 continue;
             }
             let (mode, auth) = self.mint_service_auth(s, token, policy, now, ttl_remaining);
-            out.push(models::provision::ProvisionService {
+            out.push(hackamore_models::provision::ProvisionService {
                 target: s.name.clone(),
                 flavor: s.flavor.name().to_string(),
                 address: s.address.clone(),
@@ -272,14 +272,14 @@ impl Gateway {
         &self,
         service: &Service,
         token: &str,
-        policy: &models::policy::Policy,
+        policy: &hackamore_models::policy::Policy,
         now: u64,
         ttl_remaining: u64,
     ) -> (
-        models::provision::ProvisionMode,
-        models::provision::ProvisionAuth,
+        hackamore_models::provision::ProvisionMode,
+        hackamore_models::provision::ProvisionAuth,
     ) {
-        use models::provision::{BearerAuth, ProvisionAuth, ProvisionMode, SigV4Auth};
+        use hackamore_models::provision::{BearerAuth, ProvisionAuth, ProvisionMode, SigV4Auth};
         match &service.outbound {
             Outbound::SigV4 { region, .. } => {
                 let dummy = self
@@ -315,7 +315,7 @@ impl Gateway {
         &self,
         req: &ProxyRequest,
         now: u64,
-    ) -> Result<(models::policy::Policy, AuthSource), Box<Outcome>> {
+    ) -> Result<(hackamore_models::policy::Policy, AuthSource), Box<Outcome>> {
         if let Some(auth) = req
             .headers
             .get(http::header::AUTHORIZATION)
@@ -349,7 +349,7 @@ impl Gateway {
         req: &ProxyRequest,
         auth: &str,
         now: u64,
-    ) -> Result<(models::policy::Policy, AuthSource), Box<Outcome>> {
+    ) -> Result<(hackamore_models::policy::Policy, AuthSource), Box<Outcome>> {
         let unauth = || {
             Box::new(reject(
                 http::StatusCode::UNAUTHORIZED,
@@ -419,7 +419,7 @@ impl Gateway {
         let action = normalize::normalize(&service, &req, &canonical.decoded);
         req.path = canonical.encoded;
 
-        match policy::decide(&action, &policy) {
+        match hackamore_policy::decide(&action, &policy) {
             Verdict::Deny(d) => {
                 self.audit(&action, Decision::Deny, &format!("{:?}", d.reason), now);
                 reject(http::StatusCode::FORBIDDEN, d.reason, "denied by policy")
@@ -583,8 +583,8 @@ impl Gateway {
     fn audit_raw(&self, host: &str, decision: Decision, detail: &str, now: u64) {
         let action = Action::of(
             "<unrouted>",
-            models::action::Verb::crud(models::action::CrudKind::Read),
-            models::action::Resource::of(host, "host"),
+            hackamore_models::action::Verb::crud(hackamore_models::action::CrudKind::Read),
+            hackamore_models::action::Resource::of(host, "host"),
         );
         self.audit(&action, decision, detail, now);
     }
@@ -634,10 +634,10 @@ fn reject(status: http::StatusCode, reason: DenyReason, message: &str) -> Outcom
 /// owned by the tenant. An empty-targets allow rule would grant *any* service — unsafe
 /// across trust domains — so it is rejected for tenants.
 fn validate_tenant_policy(
-    policy: &models::policy::Policy,
+    policy: &hackamore_models::policy::Policy,
     owned: &std::collections::BTreeSet<String>,
 ) -> Result<(), MintError> {
-    use models::policy::Effect;
+    use hackamore_models::policy::Effect;
     for rule in &policy.rules {
         if rule.effect != Effect::Allow {
             continue;
@@ -792,17 +792,17 @@ fn is_dropped_header(name: &http::HeaderName, source: AuthSource) -> bool {
 mod tests {
     use super::*;
     use crate::service::{Extract, Flavor, Service, ServiceRouter};
-    use control::{InMemoryAudit, Secret};
-    use models::policy::{Effect, Match, Policy, Rule};
+    use hackamore_control::{InMemoryAudit, Secret};
+    use hackamore_models::policy::{Effect, Match, Policy, Rule};
 
     /// A control plane wired with an in-memory audit sink we can inspect, plus a seeded
     /// credential. Returns the plane, the audit handle, and the credential handle.
     fn test_control() -> (
         Arc<ControlPlane>,
         Arc<InMemoryAudit>,
-        Arc<control::InMemoryCredentials>,
+        Arc<hackamore_control::InMemoryCredentials>,
     ) {
-        let creds = Arc::new(control::InMemoryCredentials::new());
+        let creds = Arc::new(hackamore_control::InMemoryCredentials::new());
         creds.insert("github-app", Secret::new("real-secret-token"));
         let audit = Arc::new(InMemoryAudit::new());
         let plane = ControlPlane::new(creds.clone(), audit.clone());
@@ -855,7 +855,9 @@ mod tests {
                 effect: Effect::Allow,
                 matches: Match {
                     targets: vec![],
-                    verbs: vec![models::action::Verb::crud(models::action::CrudKind::Read)],
+                    verbs: vec![hackamore_models::action::Verb::crud(
+                        hackamore_models::action::CrudKind::Read,
+                    )],
                     resources: vec![],
                     conditions: vec![],
                 },
@@ -1271,7 +1273,7 @@ mod tests {
         assert_eq!(doc.services[0].address, "https://gh.hackamore.local");
         assert_eq!(
             doc.services[0].mode,
-            models::provision::ProvisionMode::Inject
+            hackamore_models::provision::ProvisionMode::Inject
         );
         // An unknown token yields no doc.
         assert!(gw.provision("bogus").is_none());
@@ -1295,7 +1297,7 @@ mod tests {
                 effect: Effect::Allow,
                 matches: Match {
                     targets: vec!["github".into()],
-                    verbs: vec![models::action::Verb::action("repo:read")],
+                    verbs: vec![hackamore_models::action::Verb::action("repo:read")],
                     resources: vec![],
                     conditions: vec![],
                 },
@@ -1309,7 +1311,9 @@ mod tests {
                 effect: Effect::Allow,
                 matches: Match {
                     targets: vec!["github".into()],
-                    verbs: vec![models::action::Verb::action("repo:delete-universe")],
+                    verbs: vec![hackamore_models::action::Verb::action(
+                        "repo:delete-universe",
+                    )],
                     resources: vec![],
                     conditions: vec![],
                 },
@@ -1323,7 +1327,7 @@ mod tests {
                 effect: Effect::Allow,
                 matches: Match {
                     targets: vec!["openai".into()],
-                    verbs: vec![models::action::Verb::action("anything:goes")],
+                    verbs: vec![hackamore_models::action::Verb::action("anything:goes")],
                     resources: vec![],
                     conditions: vec![],
                 },
@@ -1346,7 +1350,7 @@ mod tests {
                 effect: Effect::Allow,
                 matches: Match {
                     targets: vec![], // any service — the old check skipped these entirely
-                    verbs: vec![models::action::Verb::action(action)],
+                    verbs: vec![hackamore_models::action::Verb::action(action)],
                     resources: vec![],
                     conditions: vec![],
                 },
@@ -1400,7 +1404,10 @@ mod tests {
         assert_eq!(doc.services.len(), 2);
         // The passthrough service is surfaced as a passthrough mode.
         let openai = doc.services.iter().find(|s| s.target == "openai").unwrap();
-        assert_eq!(openai.mode, models::provision::ProvisionMode::Passthrough);
+        assert_eq!(
+            openai.mode,
+            hackamore_models::provision::ProvisionMode::Passthrough
+        );
     }
 
     #[test]

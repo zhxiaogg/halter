@@ -2,9 +2,11 @@
 //! exercise: SSE streaming relay and fail-closed Host routing. (Per-service injection and
 //! AWS-query action gating live in `use_cases.rs`.)
 
-use gateway::{Flavor, Outbound, Service};
-use models::policy::Policy;
-use tests::{start_hackamore_services, start_hackamore_tls_services, start_mock_upstream};
+use hackamore_gateway::{Flavor, Outbound, Service};
+use hackamore_models::policy::Policy;
+use hackamore_tests::{
+    start_hackamore_services, start_hackamore_tls_services, start_mock_upstream,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn allow_all() -> Policy {
@@ -64,7 +66,7 @@ async fn sse_stream_is_relayed() {
 async fn tls_terminated_proxy_serves_https_and_publishes_ca() {
     let upstream = start_mock_upstream().await;
     let ca = include_str!("../../gateway/testdata/tls_ca.pem");
-    let tls = gateway::TlsMaterial {
+    let tls = hackamore_gateway::TlsMaterial {
         cert_pem: include_str!("../../gateway/testdata/tls_cert.pem").to_string(),
         key_pem: include_str!("../../gateway/testdata/tls_key.pem").to_string(),
         ca_pem: ca.to_string(),

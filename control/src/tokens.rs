@@ -7,8 +7,8 @@
 //! Time is passed in explicitly (`now_ms`) so minting, expiry, and resolution are all
 //! deterministically testable; the binary supplies the wall clock via [`crate::now_ms`].
 
-use models::control::MintResponse;
-use models::policy::Policy;
+use hackamore_models::control::MintResponse;
+use hackamore_models::policy::Policy;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use uuid::Uuid;

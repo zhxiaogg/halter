@@ -5,9 +5,9 @@
 //! the way the tool would and asserts the mock upstream received the injected/re-signed
 //! call.
 
-use gateway::{Extract, Flavor, Outbound, Protocol, Service};
-use models::policy::Policy;
-use tests::{Harness, start_hackamore_services, start_mock_upstream};
+use hackamore_gateway::{Extract, Flavor, Outbound, Protocol, Service};
+use hackamore_models::policy::Policy;
+use hackamore_tests::{Harness, start_hackamore_services, start_mock_upstream};
 
 fn policy(json: &str) -> Policy {
     serde_json::from_str(json).expect("valid policy json")
@@ -26,7 +26,7 @@ async fn provision_agent(
     hackamore: &Harness,
     pol: &Policy,
     home: &std::path::Path,
-) -> (String, models::provision::ProvisionDoc) {
+) -> (String, hackamore_models::provision::ProvisionDoc) {
     let token = hackamore.mint_token(pol, 3600).await;
     // Provision the way a sandboxed consumer does: via the proxy listener's reserved
     // `/.hackamore/provision` path (the admin API is unreachable from a sandbox).
@@ -247,7 +247,7 @@ async fn aws_use_case() {
         .find(|s| s.target == "ec2")
         .unwrap()
         .auth;
-    let models::provision::ProvisionAuth::SigV4(dummy) = auth else {
+    let hackamore_models::provision::ProvisionAuth::SigV4(dummy) = auth else {
         panic!("expected SigV4 provision auth");
     };
 
@@ -262,8 +262,8 @@ async fn aws_use_case() {
 
     // Helper: sign a body with the dummy cred (what the aws CLI does) and send it.
     let send = |body: &'static [u8]| {
-        let signed = gateway::sigv4::sign(
-            &gateway::sigv4::Creds {
+        let signed = hackamore_gateway::sigv4::sign(
+            &hackamore_gateway::sigv4::Creds {
                 access_key_id: &dummy.access_key_id,
                 secret_access_key: &dummy.secret_access_key,
             },
