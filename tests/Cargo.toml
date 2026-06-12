@@ -12,7 +12,7 @@ models       = { workspace = true }
 policy       = { workspace = true }
 control      = { workspace = true }
 gateway      = { workspace = true }
-halter-agent = { workspace = true }
+hackamore-agent = { workspace = true }
 serde_json   = { workspace = true }
 http         = { workspace = true }
 bytes        = { workspace = true }

@@ -1,7 +1,7 @@
-//! `halter` — the CLI entry point.
+//! `hackamore` — the CLI entry point.
 //!
-//! `halter serve --config <file>` starts the reverse proxy + admin API from a config
-//! file. `halter mint --admin-url <url> --policy <file> --ttl <secs>` calls a running
+//! `hackamore serve --config <file>` starts the reverse proxy + admin API from a config
+//! file. `hackamore mint --admin-url <url> --policy <file> --ttl <secs>` calls a running
 //! server's admin API to issue a launch token bound to that policy (handy for manual
 //! testing; in production the orchestrator calls the admin API directly).
 
@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
-    name = "halter",
+    name = "hackamore",
     about = "JIT, policy-scoped access for untrusted agents"
 )]
 struct Cli {
@@ -135,7 +135,7 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Optional TLS termination: load the PEM material, derive the rustls config, and surface
-    // the CA in the provision doc so consumers can trust halter's cert.
+    // the CA in the provision doc so consumers can trust hackamore's cert.
     let (tls_config, ca_pem) = match &cfg.tls {
         Some(t) => {
             let cert_pem = std::fs::read_to_string(&t.cert)

@@ -645,7 +645,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "halter-agent"
+name = "hackamore-agent"
 version = "0.1.0"
 dependencies = [
  "clap",
@@ -1775,7 +1775,7 @@ dependencies = [
  "bytes",
  "control",
  "gateway",
- "halter-agent",
+ "hackamore-agent",
  "http",
  "hyper",
  "hyper-util",

@@ -1,4 +1,4 @@
-//! The halter policy engine — the reusable decision core.
+//! The hackamore policy engine — the reusable decision core.
 //!
 //! Its entire public surface is one pure function, [`decide`]: given a normalized
 //! [`Action`] and an agent's [`Policy`], it returns a [`Verdict`]. No I/O, no HTTP, no

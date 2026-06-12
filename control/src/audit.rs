@@ -1,4 +1,4 @@
-//! The audit sink. Every decision halter makes — allow or deny — is recorded. The
+//! The audit sink. Every decision hackamore makes — allow or deny — is recorded. The
 //! trait lets the data plane stay oblivious to where records go; v1 ships an in-memory
 //! sink (used by tests and introspection) and a `tracing` sink for operations.
 
@@ -48,7 +48,7 @@ impl AuditSink for TracingAudit {
             resource = %event.action.resource.path,
             verb = ?event.action.verb,
             detail = %event.detail,
-            "halter decision"
+            "hackamore decision"
         );
     }
 }
@@ -130,7 +130,8 @@ mod tests {
 
     #[test]
     fn file_audit_appends_jsonl_and_reads_back() {
-        let path = std::env::temp_dir().join(format!("halter-audit-{}.jsonl", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("hackamore-audit-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         {
             let sink = FileAudit::open(&path).unwrap();

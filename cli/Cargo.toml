@@ -10,7 +10,7 @@ name = "cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "halter"
+name = "hackamore"
 path = "src/main.rs"
 
 [dependencies]

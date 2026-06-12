@@ -1,7 +1,7 @@
-# halter
+# hackamore
 
 JIT, policy-scoped access for **untrusted** AI agents to external services (GitHub
-first). The agent runs in a sandbox whose only network egress is the halter proxy; it
+first). The agent runs in a sandbox whose only network egress is the hackamore proxy; it
 never holds a real credential. The proxy normalizes each request into an `Action`, a
 reusable policy engine decides allow/deny, and on allow the proxy injects a real
 short-lived credential the agent never sees.
@@ -21,7 +21,7 @@ can be reused by any proxy (hudsucker, Envoy `ext_authz`, …) in future:
   an `Action`, calls `policy::decide`, enforces the `Verdict` (deny → 403; allow →
   inject credential + forward), and emits an audit event. Confinement (forcing the
   agent's egress through the gateway) is the sandbox's job — see horsie's nono caps.
-- **`cli`** — the `halter` binary: serve the gateway + admin API, mint tokens.
+- **`cli`** — the `hackamore` binary: serve the gateway + admin API, mint tokens.
 - **`models`** — fluorite-generated protocol/contract types.
 - **`tests`** — full-stack e2e tests.
 
