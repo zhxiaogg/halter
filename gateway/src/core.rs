@@ -8,7 +8,7 @@
 //! forward. Keeping this layer free of HTTP plumbing makes the whole decision path
 //! deterministically testable.
 
-use crate::service::{Catalog, Outbound, Service, ServiceRouter};
+use crate::service::{ActionCatalog, Outbound, Service, ServiceRouter};
 use crate::{canonicalize, normalize};
 use hackamore_control::{ControlPlane, now_ms};
 use hackamore_models::action::Action;
@@ -62,7 +62,7 @@ pub struct Gateway {
     clock: Clock,
     /// Per-target action catalogs used to validate policies at mint time. A target with
     /// no entry (or an empty catalog) is unvalidated (raw).
-    catalogs: HashMap<String, Catalog>,
+    catalogs: HashMap<String, ActionCatalog>,
     /// The CA bundle a consumer must trust to validate hackamore's TLS, surfaced in the
     /// provision doc. Empty when hackamore terminates plaintext (the sandbox-confined model).
     hackamore_ca: String,
@@ -94,7 +94,7 @@ impl Gateway {
 
     /// Attach per-target action catalogs (for mint-time policy validation). Builder.
     #[must_use]
-    pub fn with_catalogs(mut self, catalogs: HashMap<String, Catalog>) -> Self {
+    pub fn with_catalogs(mut self, catalogs: HashMap<String, ActionCatalog>) -> Self {
         self.catalogs = catalogs;
         self
     }
@@ -155,7 +155,7 @@ impl Gateway {
     fn validate_catalog(&self, policy: &hackamore_models::policy::Policy) -> Result<(), MintError> {
         use hackamore_models::action::Verb;
         use hackamore_models::policy::Effect;
-        let nonempty: Vec<&Catalog> = self.catalogs.values().filter(|c| !c.is_empty()).collect();
+        let nonempty: Vec<&ActionCatalog> = self.catalogs.values().filter(|c| !c.is_empty()).collect();
         for rule in &policy.rules {
             if rule.effect != Effect::Allow {
                 continue;
@@ -1281,12 +1281,12 @@ mod tests {
 
     #[test]
     fn catalog_validates_named_actions_at_mint() {
-        use crate::service::Catalog;
+        use crate::service::ActionCatalog;
         let (control, _a, _) = test_control();
         let mut catalogs = std::collections::HashMap::new();
         catalogs.insert(
             "github".to_string(),
-            Catalog::of(["repo:read".to_string(), "repo:write".to_string()]),
+            ActionCatalog::of(["repo:read".to_string(), "repo:write".to_string()]),
         );
         let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000))
             .with_catalogs(catalogs);
@@ -1338,10 +1338,10 @@ mod tests {
 
     #[test]
     fn catalog_validates_empty_target_named_actions() {
-        use crate::service::Catalog;
+        use crate::service::ActionCatalog;
         let (control, _a, _) = test_control();
         let mut catalogs = std::collections::HashMap::new();
-        catalogs.insert("github".to_string(), Catalog::of(["repo:read".to_string()]));
+        catalogs.insert("github".to_string(), ActionCatalog::of(["repo:read".to_string()]));
         let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000))
             .with_catalogs(catalogs);
 

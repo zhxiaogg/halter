@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use hackamore_cli::config::{Config, OutboundConfig};
 use hackamore_control::{ControlPlane, InMemoryCredentials, Secret, TracingAudit};
 use hackamore_gateway::{
-    Catalog, Extract, Flavor, Gateway, Outbound, Protocol, Service, ServiceRouter, TlsMaterial,
+    ActionCatalog, Extract, Flavor, Gateway, Outbound, Protocol, Service, ServiceRouter, TlsMaterial,
 };
 use hackamore_models::control::{MintRequest, MintResponse};
 use hackamore_models::policy::Policy;
@@ -121,16 +121,16 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         "loaded config"
     );
 
-    let mut catalogs: HashMap<String, Catalog> = HashMap::new();
+    let mut catalogs: HashMap<String, ActionCatalog> = HashMap::new();
     for s in &cfg.services {
         if let Some(path) = &s.catalog_openapi {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("read openapi {}: {e}", path.display()))?;
             let spec: serde_json::Value = serde_json::from_str(&text)
                 .map_err(|e| format!("parse openapi {}: {e}", path.display()))?;
-            catalogs.insert(s.name.clone(), Catalog::from_openapi(&spec));
+            catalogs.insert(s.name.clone(), ActionCatalog::from_openapi(&spec));
         } else if !s.catalog.is_empty() {
-            catalogs.insert(s.name.clone(), Catalog::of(s.catalog.iter().cloned()));
+            catalogs.insert(s.name.clone(), ActionCatalog::of(s.catalog.iter().cloned()));
         }
     }
 

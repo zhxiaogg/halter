@@ -53,19 +53,20 @@ pub struct Extract {
     pub path_template: Option<String>,
 }
 
-/// A per-target action vocabulary used to validate policies at mint time. Empty = no
-/// catalog (raw / unvalidated, structural checks only). Populated from a static config
-/// list today; an OpenAPI / k8s-discovery / AWS-SAR ingester produces the same set, so
-/// validation never changes when a richer source is added.
+/// A per-target **named-action** vocabulary used to validate policies at mint time
+/// (distinct from the richer per-flavor `hackamore_models::catalog::Catalog` that powers
+/// discovery). Empty = no catalog (raw / unvalidated, structural checks only). Populated
+/// from a static config list today; an OpenAPI / k8s-discovery / AWS-SAR ingester
+/// produces the same set, so validation never changes when a richer source is added.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Catalog {
+pub struct ActionCatalog {
     actions: std::collections::BTreeSet<String>,
 }
 
-impl Catalog {
+impl ActionCatalog {
     /// Build a catalog from a set of known named-action ids (e.g. "ec2:DescribeInstances").
-    /// This is the static-config ingester; richer ingesters ([`Catalog::from_openapi`], and
-    /// future k8s-discovery / AWS-SAR sources) produce the same `Catalog`, so policy
+    /// This is the static-config ingester; richer ingesters ([`ActionCatalog::from_openapi`], and
+    /// future k8s-discovery / AWS-SAR sources) produce the same `ActionCatalog`, so policy
     /// validation never changes when a source is swapped in.
     pub fn of(actions: impl IntoIterator<Item = String>) -> Self {
         Self {
@@ -343,14 +344,14 @@ mod tests {
                 "/pets/{id}": { "get": {} }
             }
         });
-        let catalog = Catalog::from_openapi(&spec);
+        let catalog = ActionCatalog::from_openapi(&spec);
         assert!(!catalog.is_empty());
         assert!(catalog.knows("listPets"));
         assert!(catalog.knows("createPet"));
         assert!(catalog.knows("GET /pets/{id}"));
         assert!(!catalog.knows("deletePet"));
         // A spec with no paths is a raw (empty) catalog.
-        assert!(Catalog::from_openapi(&serde_json::json!({})).is_empty());
+        assert!(ActionCatalog::from_openapi(&serde_json::json!({})).is_empty());
     }
 
     #[test]
