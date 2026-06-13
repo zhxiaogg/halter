@@ -149,28 +149,40 @@ function verbEditor(rule) {
   return row;
 }
 
+// Conditions are a tagged union on the wire: {type, value:{field, ...}}. Equals carries
+// {field, value}, OneOf {field, values}, Exists {field}. The editor keeps that nested
+// shape so what mints is exactly what the composer shows.
 function conditionEditor(rule) {
   const wrap = el("div");
   rule.matches.conditions.forEach((c, ci) => {
-    const field = el("input", { value: c.field || "", placeholder: "field", size: "12" });
-    field.onchange = () => { c.field = field.value; syncFromRules(); };
+    c.value = c.value || {};
+    const field = el("input", { value: c.value.field || "", placeholder: "field", size: "12" });
+    field.onchange = () => { c.value.field = field.value; syncFromRules(); };
     const type = el("select");
     for (const t of ["Equals", "OneOf", "Exists"]) {
       const o = el("option", { text: t });
       if (t === c.type) o.setAttribute("selected", "");
       type.append(o);
     }
-    type.onchange = () => { c.type = type.value; syncFromRules(); };
+    type.onchange = () => {
+      c.type = type.value;
+      // Reshape the inner value struct for the new variant, preserving the field name.
+      const f = c.value.field || "";
+      if (c.type === "Equals") c.value = { field: f, value: "" };
+      else if (c.type === "OneOf") c.value = { field: f, values: [] };
+      else c.value = { field: f };
+      syncFromRules();
+    };
     const row = el("div", { class: "cond" }, [el("label", { text: "when" }), field, type]);
     if (c.type !== "Exists") {
       const val = el("input", {
-        value: c.type === "OneOf" ? (c.values || []).join(", ") : jsonInline(c.value),
+        value: c.type === "OneOf" ? (c.value.values || []).join(", ") : jsonInline(c.value.value),
         placeholder: c.type === "OneOf" ? "v1, v2" : "value",
         size: "16",
       });
       val.onchange = () => {
-        if (c.type === "OneOf") c.values = val.value.split(",").map((s) => parseVal(s.trim()));
-        else c.value = parseVal(val.value.trim());
+        if (c.type === "OneOf") c.value.values = val.value.split(",").map((s) => parseVal(s.trim()));
+        else c.value.value = parseVal(val.value.trim());
         syncFromRules();
       };
       row.append(val);
@@ -182,7 +194,7 @@ function conditionEditor(rule) {
   });
   const add = el("button", { text: "+ condition" });
   add.onclick = () => {
-    rule.matches.conditions.push({ type: "Equals", field: "", value: "" });
+    rule.matches.conditions.push({ type: "Equals", value: { field: "", value: "" } });
     syncFromRules();
   };
   wrap.append(el("div", { class: "row" }, [add]));
