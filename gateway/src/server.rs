@@ -71,12 +71,82 @@ pub fn proxy_router(state: Arc<ServerState>) -> Router {
 /// this on a separate, localhost-only listener — it is operator/orchestrator surface,
 /// not agent surface. Provisioning is served only from `/.hackamore/provision` on the
 /// proxy listener (see [`proxy_router`]).
+///
+/// When the gateway's web UI is enabled (the default) the router also serves the
+/// authoring surface: the embedded single-page UI under `/ui` and its endpoints —
+/// `GET /catalogs`, `POST /policy/lint`, `POST /policy/test`. All of it returns 404
+/// when disabled.
 pub fn admin_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/mint", post(mint_handler))
         .route("/revoke", post(revoke_handler))
+        .route("/catalogs", get(catalogs_handler))
+        .route("/policy/lint", post(policy_lint_handler))
+        .route("/policy/test", post(policy_test_handler))
+        .route("/ui", get(ui_index_handler))
+        .route("/ui/app.js", get(ui_js_handler))
+        .route("/ui/style.css", get(ui_css_handler))
         .with_state(state)
 }
+
+/// `GET /catalogs` — the configured services and their flavor catalogs.
+async fn catalogs_handler(State(state): State<Arc<ServerState>>) -> Response {
+    if !state.gateway.web_ui() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(state.gateway.catalogs_response()).into_response()
+}
+
+/// `POST /policy/lint` — lint a policy document against the configured services'
+/// catalogs (the same check minting enforces). Always 200 with the findings array.
+async fn policy_lint_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(policy): Json<hackamore_models::policy::Policy>,
+) -> Response {
+    if !state.gateway.web_ui() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(state.gateway.lint(&policy)).into_response()
+}
+
+/// `POST /policy/test` — dry-run one synthetic request through normalize + decide.
+async fn policy_test_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<hackamore_models::dryrun::TestRequest>,
+) -> Response {
+    if !state.gateway.web_ui() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.gateway.dry_run(&req) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, &err.to_string()),
+    }
+}
+
+/// The embedded web UI: a dependency-light single-page app compiled into the binary,
+/// so `hackamore serve` needs no asset directory.
+async fn ui_index_handler(State(state): State<Arc<ServerState>>) -> Response {
+    ui_asset(&state, "text/html; charset=utf-8", WEBUI_INDEX)
+}
+
+async fn ui_js_handler(State(state): State<Arc<ServerState>>) -> Response {
+    ui_asset(&state, "application/javascript; charset=utf-8", WEBUI_JS)
+}
+
+async fn ui_css_handler(State(state): State<Arc<ServerState>>) -> Response {
+    ui_asset(&state, "text/css; charset=utf-8", WEBUI_CSS)
+}
+
+fn ui_asset(state: &ServerState, content_type: &'static str, body: &'static str) -> Response {
+    if !state.gateway.web_ui() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    ([(http::header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+const WEBUI_INDEX: &str = include_str!("webui/index.html");
+const WEBUI_JS: &str = include_str!("webui/app.js");
+const WEBUI_CSS: &str = include_str!("webui/style.css");
 
 /// Serve both routers until shutdown: the proxy on `proxy_addr`, the admin API on
 /// `admin_addr`. When `tls` is `Some`, the agent-facing proxy listener terminates TLS with
@@ -222,6 +292,16 @@ async fn mint_handler(
         .mint_checked(req.policy, req.ttl_seconds, tenant)
     {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        // A lint rejection carries structured findings so the author (or the web UI) can
+        // see every problem at once, not just the first.
+        Err(crate::core::MintError::PolicyLint(findings)) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "policy failed lint",
+                "findings": findings,
+            })),
+        )
+            .into_response(),
         Err(err) => error_response(StatusCode::FORBIDDEN, &err.to_string()),
     }
 }

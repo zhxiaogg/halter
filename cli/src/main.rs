@@ -9,7 +9,8 @@ use clap::{Parser, Subcommand};
 use hackamore_cli::config::{Config, OutboundConfig};
 use hackamore_control::{ControlPlane, InMemoryCredentials, Secret, TracingAudit};
 use hackamore_gateway::{
-    Catalog, Extract, Flavor, Gateway, Outbound, Protocol, Service, ServiceRouter, TlsMaterial,
+    ActionCatalog, Extract, Gateway, Outbound, Protocol, Service, ServiceRouter, TlsMaterial,
+    flavors,
 };
 use hackamore_models::control::{MintRequest, MintResponse};
 use hackamore_models::policy::Policy;
@@ -32,6 +33,71 @@ enum Command {
     Serve(ServeArgs),
     /// Mint a launch token bound to a policy file, via a running server's admin API.
     Mint(MintArgs),
+    /// Inspect the policy vocabulary built into this binary (no server needed).
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
+    /// Validate and dry-run policy documents offline (no server needed).
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommand {
+    /// Lint a policy file: structural errors (rules that can never match or never fire)
+    /// and catalog-derived warnings. Exits nonzero on errors.
+    Lint(PolicyLintArgs),
+    /// Dry-run one request through normalize + decide, showing the normalized action,
+    /// which rule matched, and the verdict.
+    Test(PolicyTestArgs),
+}
+
+#[derive(clap::Args)]
+struct PolicyLintArgs {
+    /// Path to the JSON policy document.
+    policy: std::path::PathBuf,
+    /// Emit findings as JSON instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct PolicyTestArgs {
+    /// Path to the JSON policy document.
+    policy: std::path::PathBuf,
+    /// Flavor to normalize the request with (e.g. "github").
+    #[arg(long)]
+    flavor: String,
+    /// Target (service instance) name the synthetic action carries; defaults to the
+    /// flavor name.
+    #[arg(long)]
+    target: Option<String>,
+    /// The request to test, as "METHOD /path[?query]", e.g. "POST /repos/o/r/pulls".
+    #[arg(long)]
+    request: String,
+    /// Body field as key=value (repeatable). Values parse as JSON when possible
+    /// (`--field draft=true` is a boolean), else as strings.
+    #[arg(long = "field")]
+    fields: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum CatalogCommand {
+    /// List every flavor's operations, resource kinds, and conditionable fields.
+    List(CatalogListArgs),
+}
+
+#[derive(clap::Args)]
+struct CatalogListArgs {
+    /// Only this flavor (e.g. "github").
+    #[arg(long)]
+    flavor: Option<String>,
+    /// Emit JSON instead of a table.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args)]
@@ -66,7 +132,118 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
         Command::Serve(args) => serve(args).await,
         Command::Mint(args) => mint(args).await,
+        Command::Catalog {
+            command: CatalogCommand::List(args),
+        } => catalog_list(&args),
+        Command::Policy { command } => match command {
+            PolicyCommand::Lint(args) => policy_lint(&args),
+            PolicyCommand::Test(args) => policy_test(&args),
+        },
     }
+}
+
+/// Read and parse a policy document.
+fn load_policy(path: &std::path::Path) -> Result<Policy, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read policy {}: {e}", path.display()))?;
+    Ok(serde_json::from_str(&text).map_err(|e| format!("parse policy {}: {e}", path.display()))?)
+}
+
+/// Lint a policy offline against the built-in flavor catalogs. Offline convention: a
+/// rule target that matches a flavor name gets that flavor's catalog (a running server
+/// lints against its configured services instead). Exits nonzero iff any Error finding.
+fn policy_lint(args: &PolicyLintArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = load_policy(&args.policy)?;
+    let catalogs: std::collections::BTreeMap<String, &hackamore_models::catalog::Catalog> =
+        flavors::registry()
+            .iter()
+            .map(|f| (f.name().to_string(), f.catalog()))
+            .collect();
+    let findings = hackamore_policy::lint::lint(&policy, &catalogs);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&findings)?);
+    } else {
+        print!("{}", hackamore_cli::render::findings_human(&findings));
+    }
+    if findings.iter().any(|f| f.is_error()) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Dry-run one synthetic request through the real normalize + decide path and print the
+/// normalized action, the matched rule, and the verdict. Exits 0 whatever the verdict —
+/// the decision is the output, not a failure.
+fn policy_test(args: &PolicyTestArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let policy = load_policy(&args.policy)?;
+    let flavor = flavors::by_name(&args.flavor)
+        .ok_or_else(|| flavors::UnknownFlavor(args.flavor.clone()).to_string())?;
+    let target = args.target.clone().unwrap_or_else(|| args.flavor.clone());
+
+    let (method, path_query) = args
+        .request
+        .split_once(' ')
+        .ok_or("--request must be \"METHOD /path[?query]\"")?;
+    let method = http::Method::from_bytes(method.trim().as_bytes())
+        .map_err(|_| format!("invalid method '{method}'"))?;
+    let (path, query) = match path_query.trim().split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (path_query.trim().to_string(), String::new()),
+    };
+
+    let mut body = serde_json::Map::new();
+    for field in &args.fields {
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| format!("--field '{field}' must be key=value"))?;
+        // JSON value when it parses (numbers, booleans, null, quoted strings), else a
+        // plain string — so `--field draft=true` means boolean true.
+        let value = serde_json::from_str(value)
+            .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+        body.insert(key.to_string(), value);
+    }
+    let body_bytes = if body.is_empty() {
+        bytes::Bytes::new()
+    } else {
+        bytes::Bytes::from(serde_json::to_vec(&body)?)
+    };
+
+    let service = Service::new(target, "*", "https://upstream.example").with_flavor(flavor);
+    let req = hackamore_gateway::ProxyRequest {
+        method,
+        path: path.clone(),
+        query,
+        headers: http::HeaderMap::new(),
+        body: body_bytes,
+    };
+    let canonical = hackamore_gateway::canonicalize::path(&req.path)
+        .map_err(|e| format!("non-canonical request path '{path}': {e:?}"))?;
+    let action = hackamore_gateway::normalize::normalize(&service, &req, &canonical.decoded);
+    let trace = hackamore_policy::decide_traced(&action, &policy);
+    print!("{}", hackamore_cli::render::trace_human(&action, &trace)?);
+    Ok(())
+}
+
+/// Print the built-in flavor catalogs — the discoverable policy vocabulary. Reads only
+/// the compiled-in registry, so it works offline with no server or config.
+fn catalog_list(args: &CatalogListArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let catalogs: Vec<_> = match args.flavor.as_deref() {
+        Some(name) => {
+            let flavor = flavors::by_name(name)
+                .ok_or_else(|| flavors::UnknownFlavor(name.to_string()).to_string())?;
+            vec![flavor.catalog().clone()]
+        }
+        None => flavors::registry()
+            .iter()
+            .map(|f| f.catalog().clone())
+            .collect(),
+    };
+    if args.json {
+        println!("{}", hackamore_cli::render::catalogs_json(&catalogs)?);
+    } else {
+        print!("{}", hackamore_cli::render::catalogs_human(&catalogs));
+    }
+    Ok(())
 }
 
 /// Build the control plane and gateway from config, then serve until shutdown.
@@ -79,14 +256,15 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     for (key, targets) in &cfg.tenants {
         control.tenants.insert(key.clone(), targets.iter().cloned());
     }
-    let services: Vec<Service> = cfg
-        .services
-        .iter()
-        .map(|s| Service {
+    let mut services: Vec<Service> = Vec::with_capacity(cfg.services.len());
+    for s in &cfg.services {
+        services.push(Service {
             name: s.name.clone(),
             host: s.host.clone(),
             upstream_base: s.upstream_base.clone(),
-            flavor: Flavor::parse(s.flavor.as_deref()),
+            // Fail closed: a typoed flavor must not silently downgrade to generic parsing.
+            flavor: flavors::resolve(s.flavor.as_deref())
+                .map_err(|e| format!("service '{}': {e}", s.name))?,
             outbound: match &s.outbound {
                 OutboundConfig::Passthrough => Outbound::Passthrough,
                 OutboundConfig::Bearer(id) => Outbound::Bearer {
@@ -113,24 +291,24 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 protocol: Protocol::parse(s.protocol.as_deref()),
                 path_template: s.path_template.clone(),
             },
-        })
-        .collect();
+        });
+    }
     tracing::info!(
         credentials = cfg.credentials.len(),
         services = services.len(),
         "loaded config"
     );
 
-    let mut catalogs: HashMap<String, Catalog> = HashMap::new();
+    let mut catalogs: HashMap<String, ActionCatalog> = HashMap::new();
     for s in &cfg.services {
         if let Some(path) = &s.catalog_openapi {
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("read openapi {}: {e}", path.display()))?;
             let spec: serde_json::Value = serde_json::from_str(&text)
                 .map_err(|e| format!("parse openapi {}: {e}", path.display()))?;
-            catalogs.insert(s.name.clone(), Catalog::from_openapi(&spec));
+            catalogs.insert(s.name.clone(), ActionCatalog::from_openapi(&spec));
         } else if !s.catalog.is_empty() {
-            catalogs.insert(s.name.clone(), Catalog::of(s.catalog.iter().cloned()));
+            catalogs.insert(s.name.clone(), ActionCatalog::of(s.catalog.iter().cloned()));
         }
     }
 
@@ -161,7 +339,11 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let gateway = Gateway::new(control, ServiceRouter::new(services))
         .with_catalogs(catalogs)
-        .with_ca(ca_pem);
+        .with_ca(ca_pem)
+        .with_web_ui(cfg.web_ui);
+    if cfg.web_ui {
+        tracing::info!(url = %format!("http://{}/ui", cfg.admin_addr), "policy studio web UI enabled");
+    }
 
     let proxy_addr = cfg.proxy_addr.parse()?;
     let admin_addr = cfg.admin_addr.parse()?;

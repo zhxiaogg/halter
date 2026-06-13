@@ -5,7 +5,7 @@
 //! the way the tool would and asserts the mock upstream received the injected/re-signed
 //! call.
 
-use hackamore_gateway::{Extract, Flavor, Outbound, Protocol, Service};
+use hackamore_gateway::{Extract, Flavor, Outbound, Protocol, Service, flavors};
 use hackamore_models::policy::Policy;
 use hackamore_tests::{Harness, start_hackamore_services, start_mock_upstream};
 
@@ -14,7 +14,7 @@ fn policy(json: &str) -> Policy {
 }
 
 /// A catch-all service (host `*`) of the given flavor + outbound, pointing at `upstream`.
-fn service(name: &str, flavor: Flavor, outbound: Outbound, upstream: &str) -> Service {
+fn service(name: &str, flavor: &'static dyn Flavor, outbound: Outbound, upstream: &str) -> Service {
     Service::new(name, "*", upstream)
         .with_flavor(flavor)
         .with_outbound(outbound)
@@ -53,7 +53,7 @@ async fn github_use_case() {
     let upstream = start_mock_upstream().await;
     let hackamore = start_hackamore_services(vec![service(
         "github",
-        Flavor::Github,
+        &flavors::GITHUB,
         Outbound::Bearer {
             credential: "github-app".into(),
         },
@@ -110,7 +110,7 @@ async fn generic_use_case() {
     let upstream = start_mock_upstream().await;
     let hackamore = start_hackamore_services(vec![service(
         "openai",
-        Flavor::Generic,
+        &flavors::GENERIC,
         Outbound::Bearer {
             credential: "openai-key".into(),
         },
@@ -150,7 +150,7 @@ async fn k8s_use_case() {
     let upstream = start_mock_upstream().await;
     let hackamore = start_hackamore_services(vec![service(
         "eks-prod",
-        Flavor::K8s,
+        &flavors::K8S,
         Outbound::Bearer {
             credential: "eks-token".into(),
         },

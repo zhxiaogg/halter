@@ -80,12 +80,33 @@ named in the policy**: each service instance owns its credential and outbound st
 (`passthrough` to forward the consumer's own credential, or `{ "inject": "<id>" }` to swap
 in the real one).
 
+The vocabulary a policy is written against (verbs, resource kinds, route shapes, and
+the fields conditions can reference) is published per flavor — run
+`hackamore catalog list` to browse it offline. `hackamore policy lint` validates a
+document against that vocabulary (rules that can never match or never fire are errors,
+and the mint API rejects them too); `hackamore policy test` dry-runs one request
+through the real normalize + decide path and reports which rule matched. Audit events
+carry the matched rule index, so every allow/deny is traceable to the rule that
+decided it. For interactive authoring, the **policy studio** web UI (served at `/ui` on
+the admin listener) pairs the catalog explorer with a composer: click an operation to
+add a rule, edit verbs/resources/conditions, watch lint run live, dry-run a request, and
+mint — all backed by the same `/catalogs`, `/policy/lint`, and `/policy/test` admin
+endpoints.
+
 ## Quickstart
 
 ```bash
 make build
+# discover what policies can say (flavors, operations, resource kinds, fields)
+cargo run -p cli --bin hackamore -- catalog list
+# validate a policy and dry-run a request against it — all offline, no server
+cargo run -p cli --bin hackamore -- policy lint examples/policy.reviewer-bot.json
+cargo run -p cli --bin hackamore -- policy test examples/policy.reviewer-bot.json \
+  --flavor github --request "POST /repos/octocat/hello/pulls" --field base=develop
 # edit examples/config.json: set a real credential and your agents' policies
 make run                      # serves proxy on :9090, admin API on :9091
+# open the policy studio (browse the catalog, compose + lint + dry-run + mint a token):
+#   http://127.0.0.1:9091/ui   (admin listener; set "web_ui": false to disable)
 
 # mint a launch token from a policy document (the orchestrator does this at launch)
 cargo run -p cli --bin hackamore -- mint --admin-url http://127.0.0.1:9091 \

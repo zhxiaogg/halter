@@ -33,6 +33,21 @@ pub mod provision {
     include!(concat!(env!("OUT_DIR"), "/provision/mod.rs"));
 }
 
+#[allow(clippy::doc_markdown, clippy::too_many_arguments)]
+pub mod catalog {
+    include!(concat!(env!("OUT_DIR"), "/catalog/mod.rs"));
+}
+
+#[allow(clippy::doc_markdown, clippy::too_many_arguments)]
+pub mod lint {
+    include!(concat!(env!("OUT_DIR"), "/lint/mod.rs"));
+}
+
+#[allow(clippy::doc_markdown, clippy::too_many_arguments)]
+pub mod dryrun {
+    include!(concat!(env!("OUT_DIR"), "/dryrun/mod.rs"));
+}
+
 /// An empty `fields` JSON object — the default when a request carries no query or body
 /// attributes relevant to conditional rules.
 pub fn empty_fields() -> serde_json::Value {
@@ -129,10 +144,118 @@ impl verdict::Verdict {
     }
 }
 
+impl catalog::HttpMethod {
+    /// The canonical uppercase method string, e.g. "POST".
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            catalog::HttpMethod::Get => "GET",
+            catalog::HttpMethod::Post => "POST",
+            catalog::HttpMethod::Put => "PUT",
+            catalog::HttpMethod::Patch => "PATCH",
+            catalog::HttpMethod::Delete => "DELETE",
+        }
+    }
+}
+
+impl catalog::FieldSpec {
+    /// Ergonomic constructor (the generated `new` takes `String` positionally).
+    pub fn of(
+        name: impl Into<String>,
+        source: catalog::FieldSource,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            source,
+            summary: summary.into(),
+        }
+    }
+}
+
+impl catalog::Operation {
+    /// Ergonomic constructor with no documented fields; chain
+    /// [`catalog::Operation::with_fields`] to add them.
+    pub fn of(
+        id: impl Into<String>,
+        verb: action::Verb,
+        method: catalog::HttpMethod,
+        path_template: impl Into<String>,
+        resource_kind: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            verb,
+            route: catalog::Route {
+                method,
+                path_template: path_template.into(),
+            },
+            resource_kind: resource_kind.into(),
+            fields: vec![],
+            summary: summary.into(),
+        }
+    }
+
+    /// Set the documented conditionable fields.
+    #[must_use]
+    pub fn with_fields(mut self, fields: Vec<catalog::FieldSpec>) -> Self {
+        self.fields = fields;
+        self
+    }
+}
+
+impl catalog::Catalog {
+    /// Ergonomic constructor.
+    pub fn of(flavor: impl Into<String>, operations: Vec<catalog::Operation>) -> Self {
+        Self {
+            flavor: flavor.into(),
+            operations,
+        }
+    }
+}
+
+impl dryrun::MatchedRule {
+    /// Build from the engine trace's `Option<usize>`.
+    pub fn of(matched_rule: Option<usize>) -> Self {
+        match matched_rule {
+            Some(index) => dryrun::MatchedRule::Rule(dryrun::RuleIndex {
+                index: index as u64,
+            }),
+            None => dryrun::MatchedRule::NoMatch(dryrun::NoMatch {}),
+        }
+    }
+}
+
+impl lint::Finding {
+    /// An `Error` finding: the rule can never do what its author meant; rejects a mint.
+    pub fn error(rule_index: usize, message: impl Into<String>) -> Self {
+        Self {
+            severity: lint::Severity::Error,
+            rule_index: rule_index as u64,
+            message: message.into(),
+        }
+    }
+
+    /// A `Warning` finding: passes lint but deserves a look.
+    pub fn warning(rule_index: usize, message: impl Into<String>) -> Self {
+        Self {
+            severity: lint::Severity::Warning,
+            rule_index: rule_index as u64,
+            message: message.into(),
+        }
+    }
+
+    /// Whether this finding rejects a mint.
+    pub fn is_error(&self) -> bool {
+        self.severity == lint::Severity::Error
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::action::{Action, CrudKind, Resource, Verb};
+    use super::catalog::{Catalog, FieldSource, FieldSpec, HttpMethod, Operation};
     use super::verdict::{DenyReason, Verdict};
 
     #[test]
@@ -166,6 +289,48 @@ mod tests {
         let json = serde_json::to_string(&terminate).unwrap();
         let back: Verb = serde_json::from_str(&json).unwrap();
         assert_eq!(terminate, back);
+    }
+
+    #[test]
+    fn catalog_round_trips_through_json_with_expected_shape() {
+        let op = Operation::of(
+            "pulls.create",
+            Verb::crud(CrudKind::Create),
+            HttpMethod::Post,
+            "repos/{owner}/{repo}/pulls",
+            "pull_request",
+            "Open a pull request",
+        )
+        .with_fields(vec![FieldSpec::of(
+            "base",
+            FieldSource::Body,
+            "target branch",
+        )]);
+        let catalog = Catalog::of("github", vec![op]);
+
+        let json = serde_json::to_value(&catalog).unwrap();
+        // The verb is the tagged union, the method a plain enum string.
+        assert_eq!(json["flavor"], "github");
+        assert_eq!(json["operations"][0]["verb"]["type"], "Crud");
+        assert_eq!(json["operations"][0]["route"]["method"], "Post");
+        assert_eq!(json["operations"][0]["fields"][0]["source"], "Body");
+
+        let back: Catalog = serde_json::from_value(json).unwrap();
+        assert_eq!(catalog, back);
+        assert_eq!(HttpMethod::Post.as_str(), "POST");
+    }
+
+    #[test]
+    fn finding_constructors_and_json_shape() {
+        let f = super::lint::Finding::error(2, "rule 2 can never match");
+        assert!(f.is_error());
+        assert!(!super::lint::Finding::warning(0, "looks odd").is_error());
+        let json = serde_json::to_value(&f).unwrap();
+        assert_eq!(json["severity"], "Error");
+        // Fluorite structs serialize camelCase on the wire.
+        assert_eq!(json["ruleIndex"], 2);
+        let back: super::lint::Finding = serde_json::from_value(json).unwrap();
+        assert_eq!(f, back);
     }
 
     #[test]

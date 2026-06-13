@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>hackamore — policy studio</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+  <header>
+    <h1>hackamore <span class="muted">policy studio</span></h1>
+    <p class="muted">Browse what policies can say, compose one, lint it live, dry-run a request, mint a token. Default-deny: anything you don't allow is denied.</p>
+  </header>
+
+  <main>
+    <section id="explorer" class="pane">
+      <h2>Catalog explorer</h2>
+      <p class="muted">The published vocabulary per service. Click <b>+ allow</b> on an operation to add a rule for it.</p>
+      <div id="catalogs"></div>
+    </section>
+
+    <section id="composer" class="pane">
+      <h2>Policy composer</h2>
+      <div id="rules"></div>
+      <div class="row">
+        <button id="add-rule">+ empty rule</button>
+      </div>
+
+      <h3>Lint <span id="lint-status" class="pill"></span></h3>
+      <div id="findings" class="findings"></div>
+
+      <h3>Policy JSON</h3>
+      <textarea id="policy-json" rows="10" spellcheck="false"></textarea>
+      <div class="row">
+        <button id="apply-json" title="Parse the JSON above back into the composer">apply JSON edits</button>
+        <button id="copy-json">copy</button>
+      </div>
+
+      <h3>Dry-run a request</h3>
+      <div class="row">
+        <select id="test-target"></select>
+        <select id="test-method">
+          <option>GET</option><option>POST</option><option>PUT</option>
+          <option>PATCH</option><option>DELETE</option>
+        </select>
+        <input id="test-path" placeholder="/repos/octocat/hello/pulls" size="34">
+      </div>
+      <div class="row">
+        <input id="test-fields" placeholder='body fields, e.g. {"base":"develop","title":"hi"}' size="50">
+        <button id="run-test">test</button>
+      </div>
+      <pre id="test-result" class="result"></pre>
+
+      <h3>Mint</h3>
+      <div class="row">
+        <label>ttl <input id="mint-ttl" type="number" value="3600" min="1" style="width:7em"> s</label>
+        <button id="mint">mint token</button>
+      </div>
+      <pre id="mint-result" class="result"></pre>
+    </section>
+  </main>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>

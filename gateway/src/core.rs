@@ -8,7 +8,7 @@
 //! forward. Keeping this layer free of HTTP plumbing makes the whole decision path
 //! deterministically testable.
 
-use crate::service::{Catalog, Outbound, Service, ServiceRouter};
+use crate::service::{ActionCatalog, Outbound, Service, ServiceRouter};
 use crate::{canonicalize, normalize};
 use hackamore_control::{ControlPlane, now_ms};
 use hackamore_models::action::Action;
@@ -62,10 +62,14 @@ pub struct Gateway {
     clock: Clock,
     /// Per-target action catalogs used to validate policies at mint time. A target with
     /// no entry (or an empty catalog) is unvalidated (raw).
-    catalogs: HashMap<String, Catalog>,
+    catalogs: HashMap<String, ActionCatalog>,
     /// The CA bundle a consumer must trust to validate hackamore's TLS, surfaced in the
     /// provision doc. Empty when hackamore terminates plaintext (the sandbox-confined model).
     hackamore_ca: String,
+    /// Whether the admin listener serves the web UI and its authoring endpoints
+    /// (`/ui`, `GET /catalogs`, `POST /policy/lint`, `POST /policy/test`). On by
+    /// default — the admin listener is operator-only — and switchable off in config.
+    web_ui: bool,
 }
 
 impl Gateway {
@@ -78,6 +82,7 @@ impl Gateway {
             clock: Arc::new(now_ms),
             catalogs: HashMap::new(),
             hackamore_ca: String::new(),
+            web_ui: true,
         }
     }
 
@@ -89,12 +94,25 @@ impl Gateway {
             clock,
             catalogs: HashMap::new(),
             hackamore_ca: String::new(),
+            web_ui: true,
         }
+    }
+
+    /// Enable/disable the admin web UI and its authoring endpoints. Builder.
+    #[must_use]
+    pub fn with_web_ui(mut self, enabled: bool) -> Self {
+        self.web_ui = enabled;
+        self
+    }
+
+    /// Whether the admin listener serves the web UI and authoring endpoints.
+    pub fn web_ui(&self) -> bool {
+        self.web_ui
     }
 
     /// Attach per-target action catalogs (for mint-time policy validation). Builder.
     #[must_use]
-    pub fn with_catalogs(mut self, catalogs: HashMap<String, Catalog>) -> Self {
+    pub fn with_catalogs(mut self, catalogs: HashMap<String, ActionCatalog>) -> Self {
         self.catalogs = catalogs;
         self
     }
@@ -140,7 +158,111 @@ impl Gateway {
             validate_tenant_policy(&policy, &owned)?;
         }
         self.validate_catalog(&policy)?;
+        self.lint_policy(&policy)?;
         Ok(self.mint(policy, ttl_seconds))
+    }
+
+    /// Run the catalog-aware policy lint with each configured service's flavor catalog.
+    /// Error findings reject the mint (fail fast: a policy with a rule that can never do
+    /// what its author meant must not silently mint and then deny everything); warnings
+    /// are returned to the caller in logs only.
+    fn lint_policy(&self, policy: &hackamore_models::policy::Policy) -> Result<(), MintError> {
+        let findings = self.lint(policy);
+        for finding in findings.iter().filter(|f| !f.is_error()) {
+            tracing::warn!(
+                rule = finding.rule_index,
+                "policy lint warning: {}",
+                finding.message
+            );
+        }
+        if findings
+            .iter()
+            .any(hackamore_models::lint::Finding::is_error)
+        {
+            return Err(MintError::PolicyLint(findings));
+        }
+        Ok(())
+    }
+
+    /// Lint a policy against the configured services' flavor catalogs (the same check
+    /// minting enforces; also served as `POST /policy/lint` on the admin API).
+    pub fn lint(
+        &self,
+        policy: &hackamore_models::policy::Policy,
+    ) -> Vec<hackamore_models::lint::Finding> {
+        let catalogs: std::collections::BTreeMap<String, &hackamore_models::catalog::Catalog> =
+            self.router
+                .services()
+                .iter()
+                .map(|s| (s.name.clone(), s.flavor.catalog()))
+                .collect();
+        hackamore_policy::lint::lint(policy, &catalogs)
+    }
+
+    /// The configured services and the catalogs of the flavors they use — what the
+    /// composer needs to offer real target names (served as `GET /catalogs`).
+    pub fn catalogs_response(&self) -> hackamore_models::catalog::CatalogsResponse {
+        use hackamore_models::catalog::{CatalogsResponse, ServiceFlavor};
+        let services: Vec<ServiceFlavor> = self
+            .router
+            .services()
+            .iter()
+            .map(|s| ServiceFlavor {
+                name: s.name.clone(),
+                flavor: s.flavor.name().to_string(),
+            })
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let catalogs = self
+            .router
+            .services()
+            .iter()
+            .filter(|s| seen.insert(s.flavor.name()))
+            .map(|s| s.flavor.catalog().clone())
+            .collect();
+        CatalogsResponse { services, catalogs }
+    }
+
+    /// Dry-run one synthetic request through the real canonicalize → normalize →
+    /// decide path under a not-yet-minted policy (served as `POST /policy/test`). No
+    /// token, no forwarding, no audit: this is an authoring tool, not an enforcement
+    /// path.
+    pub fn dry_run(
+        &self,
+        req: &hackamore_models::dryrun::TestRequest,
+    ) -> Result<hackamore_models::dryrun::TestResponse, DryRunError> {
+        use hackamore_models::dryrun::{MatchedRule, TestResponse};
+        let service = self
+            .router
+            .services()
+            .iter()
+            .find(|s| s.name == req.target)
+            .ok_or_else(|| DryRunError::UnknownTarget(req.target.clone()))?;
+        let method = http::Method::from_bytes(req.method.as_bytes())
+            .map_err(|_| DryRunError::InvalidMethod(req.method.clone()))?;
+        let body = if req.fields.as_object().is_some_and(|o| !o.is_empty()) {
+            serde_json::to_vec(&req.fields)
+                .map(bytes::Bytes::from)
+                .unwrap_or_default()
+        } else {
+            bytes::Bytes::new()
+        };
+        let proxy_req = ProxyRequest {
+            method,
+            path: req.path.clone(),
+            query: req.query.clone(),
+            headers: http::HeaderMap::new(),
+            body,
+        };
+        let canonical = canonicalize::path(&proxy_req.path)
+            .map_err(|_| DryRunError::NonCanonicalPath(req.path.clone()))?;
+        let action = normalize::normalize(service, &proxy_req, &canonical.decoded);
+        let trace = hackamore_policy::decide_traced(&action, &req.policy);
+        Ok(TestResponse {
+            action,
+            verdict: trace.verdict,
+            matched: MatchedRule::of(trace.matched_rule),
+        })
     }
 
     /// Validate a policy's named-action verbs against the catalogs. A target with no catalog
@@ -155,7 +277,8 @@ impl Gateway {
     fn validate_catalog(&self, policy: &hackamore_models::policy::Policy) -> Result<(), MintError> {
         use hackamore_models::action::Verb;
         use hackamore_models::policy::Effect;
-        let nonempty: Vec<&Catalog> = self.catalogs.values().filter(|c| !c.is_empty()).collect();
+        let nonempty: Vec<&ActionCatalog> =
+            self.catalogs.values().filter(|c| !c.is_empty()).collect();
         for rule in &policy.rules {
             if rule.effect != Effect::Allow {
                 continue;
@@ -419,14 +542,23 @@ impl Gateway {
         let action = normalize::normalize(&service, &req, &canonical.decoded);
         req.path = canonical.encoded;
 
-        match hackamore_policy::decide(&action, &policy) {
+        let trace = hackamore_policy::decide_traced(&action, &policy);
+        match trace.verdict {
             Verdict::Deny(d) => {
-                self.audit(&action, Decision::Deny, &format!("{:?}", d.reason), now);
+                // Carry which rule denied (if any) so a denial is debuggable from the
+                // audit log alone; `None` = default-deny fallthrough.
+                let detail = match trace.matched_rule {
+                    Some(rule) => format!("{:?} (rule {rule})", d.reason),
+                    None => format!("{:?} (no rule matched)", d.reason),
+                };
+                self.audit(&action, Decision::Deny, &detail, now);
                 reject(http::StatusCode::FORBIDDEN, d.reason, "denied by policy")
             }
             // On allow the outbound credential is the matched service's property, not the
             // policy's — the engine's allow is bare.
-            Verdict::Allow(_) => self.plan_forward(&service, &action, req, source, now),
+            Verdict::Allow(_) => {
+                self.plan_forward(&service, &action, req, source, trace.matched_rule, now)
+            }
         }
     }
 
@@ -441,6 +573,7 @@ impl Gateway {
         action: &Action,
         req: ProxyRequest,
         source: AuthSource,
+        matched_rule: Option<usize>,
         now: u64,
     ) -> Outcome {
         let mut headers = sanitize_headers(&req.headers, source);
@@ -524,6 +657,10 @@ impl Gateway {
                 );
                 format!("allowed; sigv4 re-signed [{credential}]")
             }
+        };
+        let detail = match matched_rule {
+            Some(rule) => format!("{detail}; rule {rule}"),
+            None => detail,
         };
         self.audit(action, Decision::Allow, &detail, now);
 
@@ -656,8 +793,33 @@ fn validate_tenant_policy(
 
 /// Why a mint request was refused. A typed error so the data plane maps each cause to a
 /// precise response instead of threading an opaque `String`. All variants are
-/// authorization/validation failures the operator surface renders as `403`.
+/// Why a dry-run request could not even be normalized (the authoring-tool analogue of
+/// the proxy's 4xx rejections). Rendered as a 400 by the admin API.
 #[derive(Debug, PartialEq, Eq)]
+pub enum DryRunError {
+    /// `target` names no configured service.
+    UnknownTarget(String),
+    /// The method string is not a valid HTTP method.
+    InvalidMethod(String),
+    /// The path failed canonicalization (escapes the root, bad encoding, …).
+    NonCanonicalPath(String),
+}
+
+impl std::fmt::Display for DryRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DryRunError::UnknownTarget(t) => write!(f, "unknown target '{t}'"),
+            DryRunError::InvalidMethod(m) => write!(f, "invalid method '{m}'"),
+            DryRunError::NonCanonicalPath(p) => write!(f, "non-canonical path '{p}'"),
+        }
+    }
+}
+
+impl std::error::Error for DryRunError {}
+
+/// authorization/validation failures the operator surface renders as `403`.
+/// (`PartialEq` only: lint findings are fluorite wire types without `Eq`.)
+#[derive(Debug, PartialEq)]
 pub enum MintError {
     /// Tenants are configured but the request presented no tenant credential.
     MissingTenant,
@@ -670,6 +832,9 @@ pub enum MintError {
     TenantWildcardTarget,
     /// A named-action verb is absent from the target's action catalog.
     UnknownAction { target: String, action: String },
+    /// The policy failed lint with at least one `Error` finding. Carries *all* findings
+    /// (warnings included) so the rejection response can show the full picture.
+    PolicyLint(Vec<hackamore_models::lint::Finding>),
 }
 
 impl std::fmt::Display for MintError {
@@ -686,6 +851,18 @@ impl std::fmt::Display for MintError {
                     f,
                     "action '{action}' is not in the catalog for target '{target}'"
                 )
+            }
+            MintError::PolicyLint(findings) => {
+                let errors: Vec<&hackamore_models::lint::Finding> =
+                    findings.iter().filter(|f| f.is_error()).collect();
+                let first = errors
+                    .first()
+                    .map(|e| format!("rule {}: {}", e.rule_index, e.message))
+                    .unwrap_or_default();
+                match errors.len() {
+                    0 | 1 => write!(f, "policy failed lint: {first}"),
+                    n => write!(f, "policy failed lint: {first} (+{} more)", n - 1),
+                }
             }
         }
     }
@@ -791,7 +968,8 @@ fn is_dropped_header(name: &http::HeaderName, source: AuthSource) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::service::{Extract, Flavor, Service, ServiceRouter};
+    use crate::flavors;
+    use crate::service::{Extract, Service, ServiceRouter};
     use hackamore_control::{InMemoryAudit, Secret};
     use hackamore_models::policy::{Effect, Match, Policy, Rule};
 
@@ -813,7 +991,7 @@ mod tests {
     fn router() -> ServiceRouter {
         ServiceRouter::new(vec![
             Service::new("github", "*", "https://api.github.com")
-                .with_flavor(Flavor::Github)
+                .with_flavor(&flavors::GITHUB)
                 .with_outbound(Outbound::Bearer {
                     credential: "github-app".into(),
                 }),
@@ -1232,12 +1410,96 @@ mod tests {
             Outcome::Forward(_) => panic!("expected reject"),
         }
         assert_eq!(audit.events()[0].decision, Decision::Deny);
+        // Default-deny fallthrough is explicit in the audit detail.
+        assert_eq!(audit.events()[0].detail, "NotAllowed (no rule matched)");
+    }
+
+    #[test]
+    fn audit_detail_carries_the_matched_rule_index() {
+        let (control, audit, _) = test_control();
+        let gw = Gateway::with_clock(control, router(), fixed_clock(1_000));
+        let minted = gw.mint(read_only(), 60);
+        let get = ProxyRequest {
+            method: http::Method::GET,
+            path: "/repos/o/r".into(),
+            query: String::new(),
+            headers: bearer(&minted.token),
+            body: bytes::Bytes::new(),
+        };
+        assert!(matches!(gw.handle(get), Outcome::Forward(_)));
+        assert_eq!(audit.events()[0].decision, Decision::Allow);
+        assert!(
+            audit.events()[0].detail.ends_with("; rule 0"),
+            "{}",
+            audit.events()[0].detail
+        );
+    }
+
+    #[test]
+    fn mint_rejects_policies_that_fail_lint() {
+        let (control, _, _) = test_control();
+        let gw = Gateway::with_clock(control, router(), fixed_clock(1_000));
+
+        // An unmatchable glob (leading slash) is an Error finding.
+        let bad_glob = Policy {
+            rules: vec![Rule {
+                effect: Effect::Allow,
+                matches: Match {
+                    targets: vec![],
+                    verbs: vec![],
+                    resources: vec!["/repos/o/**".into()],
+                    conditions: vec![],
+                },
+            }],
+        };
+        match gw.mint_checked(bad_glob, 60, None) {
+            Err(MintError::PolicyLint(findings)) => {
+                assert!(findings.iter().any(|f| f.is_error()));
+            }
+            other => panic!("expected lint rejection, got {other:?}"),
+        }
+
+        // A deny rule shadowed by an earlier allow-all never fires: also rejected.
+        let shadowed_deny = Policy {
+            rules: vec![
+                allow_all().rules[0].clone(),
+                Rule {
+                    effect: Effect::Deny,
+                    matches: Match {
+                        targets: vec![],
+                        verbs: vec![hackamore_models::action::Verb::crud(
+                            hackamore_models::action::CrudKind::Delete,
+                        )],
+                        resources: vec![],
+                        conditions: vec![],
+                    },
+                },
+            ],
+        };
+        assert!(matches!(
+            gw.mint_checked(shadowed_deny, 60, None),
+            Err(MintError::PolicyLint(_))
+        ));
+
+        // Warnings alone do not reject: a glob outside the curated github catalog mints.
+        let uncatalogued = Policy {
+            rules: vec![Rule {
+                effect: Effect::Allow,
+                matches: Match {
+                    targets: vec!["github".into()],
+                    verbs: vec![],
+                    resources: vec!["orgs/octocat/teams".into()],
+                    conditions: vec![],
+                },
+            }],
+        };
+        assert!(gw.mint_checked(uncatalogued, 60, None).is_ok());
     }
 
     fn two_service_router() -> ServiceRouter {
         ServiceRouter::new(vec![
             Service::new("github", "api.github.com", "https://api.github.com")
-                .with_flavor(Flavor::Github)
+                .with_flavor(&flavors::GITHUB)
                 .with_outbound(Outbound::Bearer {
                     credential: "github-app".into(),
                 })
@@ -1281,12 +1543,12 @@ mod tests {
 
     #[test]
     fn catalog_validates_named_actions_at_mint() {
-        use crate::service::Catalog;
+        use crate::service::ActionCatalog;
         let (control, _a, _) = test_control();
         let mut catalogs = std::collections::HashMap::new();
         catalogs.insert(
             "github".to_string(),
-            Catalog::of(["repo:read".to_string(), "repo:write".to_string()]),
+            ActionCatalog::of(["repo:read".to_string(), "repo:write".to_string()]),
         );
         let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000))
             .with_catalogs(catalogs);
@@ -1338,10 +1600,13 @@ mod tests {
 
     #[test]
     fn catalog_validates_empty_target_named_actions() {
-        use crate::service::Catalog;
+        use crate::service::ActionCatalog;
         let (control, _a, _) = test_control();
         let mut catalogs = std::collections::HashMap::new();
-        catalogs.insert("github".to_string(), Catalog::of(["repo:read".to_string()]));
+        catalogs.insert(
+            "github".to_string(),
+            ActionCatalog::of(["repo:read".to_string()]),
+        );
         let gw = Gateway::with_clock(control, two_service_router(), fixed_clock(1_000))
             .with_catalogs(catalogs);
 

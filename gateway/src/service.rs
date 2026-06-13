@@ -3,18 +3,7 @@
 //! whose host matches no service is denied (fail closed). Each service names how its
 //! requests are normalized into an `Action` (its [`Flavor`]).
 
-/// How a service's requests are normalized into an `Action`. Also a tool hint the
-/// provision doc surfaces so `hackamore-agent` writes the right native config.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Flavor {
-    /// GitHub-aware resource parsing (repo/pull_request/issue kinds).
-    Github,
-    /// Kubernetes-aware resource parsing (namespace + resource kind).
-    K8s,
-    /// Path-based generic parsing — works for any HTTP/JSON or SSE service.
-    #[default]
-    Generic,
-}
+use crate::flavors::{self, Flavor};
 
 /// The wire protocol that decides *where the operation lives* in a request — the only
 /// real branch in extraction. `Rest` (the default) reads the HTTP method + path; the AWS
@@ -53,19 +42,20 @@ pub struct Extract {
     pub path_template: Option<String>,
 }
 
-/// A per-target action vocabulary used to validate policies at mint time. Empty = no
-/// catalog (raw / unvalidated, structural checks only). Populated from a static config
-/// list today; an OpenAPI / k8s-discovery / AWS-SAR ingester produces the same set, so
-/// validation never changes when a richer source is added.
+/// A per-target **named-action** vocabulary used to validate policies at mint time
+/// (distinct from the richer per-flavor `hackamore_models::catalog::Catalog` that powers
+/// discovery). Empty = no catalog (raw / unvalidated, structural checks only). Populated
+/// from a static config list today; an OpenAPI / k8s-discovery / AWS-SAR ingester
+/// produces the same set, so validation never changes when a richer source is added.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Catalog {
+pub struct ActionCatalog {
     actions: std::collections::BTreeSet<String>,
 }
 
-impl Catalog {
+impl ActionCatalog {
     /// Build a catalog from a set of known named-action ids (e.g. "ec2:DescribeInstances").
-    /// This is the static-config ingester; richer ingesters ([`Catalog::from_openapi`], and
-    /// future k8s-discovery / AWS-SAR sources) produce the same `Catalog`, so policy
+    /// This is the static-config ingester; richer ingesters ([`ActionCatalog::from_openapi`], and
+    /// future k8s-discovery / AWS-SAR sources) produce the same `ActionCatalog`, so policy
     /// validation never changes when a source is swapped in.
     pub fn of(actions: impl IntoIterator<Item = String>) -> Self {
         Self {
@@ -108,26 +98,6 @@ impl Catalog {
     /// Whether `action` is a known catalog action.
     pub fn knows(&self, action: &str) -> bool {
         self.actions.contains(action)
-    }
-}
-
-impl Flavor {
-    /// Parse a flavor name; unknown/absent values default to [`Flavor::Generic`].
-    pub fn parse(name: Option<&str>) -> Self {
-        match name {
-            Some(n) if n.eq_ignore_ascii_case("github") => Flavor::Github,
-            Some(n) if n.eq_ignore_ascii_case("k8s") => Flavor::K8s,
-            _ => Flavor::Generic,
-        }
-    }
-
-    /// The canonical lowercase flavor name (the inverse of [`Flavor::parse`]).
-    pub fn name(self) -> &'static str {
-        match self {
-            Flavor::Github => "github",
-            Flavor::K8s => "k8s",
-            Flavor::Generic => "generic",
-        }
     }
 }
 
@@ -174,7 +144,7 @@ impl Outbound {
 /// setters rather than filling all seven fields positionally; everything but the name,
 /// host, and upstream base has a sensible default (generic flavor, passthrough outbound,
 /// no consumer address, Tier-0 extraction).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Service {
     /// Logical instance name; becomes `Action.target` and what policy rules scope to.
     pub name: String,
@@ -183,8 +153,8 @@ pub struct Service {
     pub host: String,
     /// Upstream base URL without a trailing slash, e.g. `https://api.github.com`.
     pub upstream_base: String,
-    /// How requests to this service are normalized.
-    pub flavor: Flavor,
+    /// How requests to this service are normalized (resolved from [`flavors::registry`]).
+    pub flavor: &'static dyn Flavor,
     /// What hackamore does with upstream auth on allow.
     pub outbound: Outbound,
     /// Consumer-facing address the agent points its tool at to reach this service
@@ -192,6 +162,20 @@ pub struct Service {
     pub address: String,
     /// How requests are normalized into an `Action` (protocol + field extraction).
     pub extract: Extract,
+}
+
+impl Default for Service {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            host: String::new(),
+            upstream_base: String::new(),
+            flavor: &flavors::GENERIC,
+            outbound: Outbound::default(),
+            address: String::new(),
+            extract: Extract::default(),
+        }
+    }
 }
 
 impl Service {
@@ -210,9 +194,9 @@ impl Service {
         }
     }
 
-    /// Set the normalization flavor.
+    /// Set the normalization flavor (a registered [`Flavor`], e.g. `&flavors::GITHUB`).
     #[must_use]
-    pub fn with_flavor(mut self, flavor: Flavor) -> Self {
+    pub fn with_flavor(mut self, flavor: &'static dyn Flavor) -> Self {
         self.flavor = flavor;
         self
     }
@@ -343,21 +327,13 @@ mod tests {
                 "/pets/{id}": { "get": {} }
             }
         });
-        let catalog = Catalog::from_openapi(&spec);
+        let catalog = ActionCatalog::from_openapi(&spec);
         assert!(!catalog.is_empty());
         assert!(catalog.knows("listPets"));
         assert!(catalog.knows("createPet"));
         assert!(catalog.knows("GET /pets/{id}"));
         assert!(!catalog.knows("deletePet"));
         // A spec with no paths is a raw (empty) catalog.
-        assert!(Catalog::from_openapi(&serde_json::json!({})).is_empty());
-    }
-
-    #[test]
-    fn flavor_parse_defaults_generic() {
-        assert_eq!(Flavor::parse(Some("github")), Flavor::Github);
-        assert_eq!(Flavor::parse(Some("GitHub")), Flavor::Github);
-        assert_eq!(Flavor::parse(Some("rest")), Flavor::Generic);
-        assert_eq!(Flavor::parse(None), Flavor::Generic);
+        assert!(ActionCatalog::from_openapi(&serde_json::json!({})).is_empty());
     }
 }
