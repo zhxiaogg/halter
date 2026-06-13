@@ -43,6 +43,11 @@ pub mod lint {
     include!(concat!(env!("OUT_DIR"), "/lint/mod.rs"));
 }
 
+#[allow(clippy::doc_markdown, clippy::too_many_arguments)]
+pub mod dryrun {
+    include!(concat!(env!("OUT_DIR"), "/dryrun/mod.rs"));
+}
+
 /// An empty `fields` JSON object — the default when a request carries no query or body
 /// attributes relevant to conditional rules.
 pub fn empty_fields() -> serde_json::Value {
@@ -205,6 +210,18 @@ impl catalog::Catalog {
         Self {
             flavor: flavor.into(),
             operations,
+        }
+    }
+}
+
+impl dryrun::MatchedRule {
+    /// Build from the engine trace's `Option<usize>`.
+    pub fn of(matched_rule: Option<usize>) -> Self {
+        match matched_rule {
+            Some(index) => dryrun::MatchedRule::Rule(dryrun::RuleIndex {
+                index: index as u64,
+            }),
+            None => dryrun::MatchedRule::NoMatch(dryrun::NoMatch {}),
         }
     }
 }

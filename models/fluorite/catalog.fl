@@ -69,3 +69,19 @@ struct Catalog {
     flavor: String,
     operations: Vec<Operation>,
 }
+
+/// One configured service instance and the flavor it normalizes with — what a policy's
+/// `targets` actually name. Lets the composer offer real target names.
+struct ServiceFlavor {
+    /// Service instance name (`Action.target`).
+    name: String,
+    /// The flavor's canonical name, keying into `CatalogsResponse.catalogs`.
+    flavor: String,
+}
+
+/// The admin `GET /catalogs` response: the configured services and the catalogs of the
+/// flavors they use.
+struct CatalogsResponse {
+    services: Vec<ServiceFlavor>,
+    catalogs: Vec<Catalog>,
+}

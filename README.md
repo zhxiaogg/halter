@@ -87,7 +87,11 @@ document against that vocabulary (rules that can never match or never fire are e
 and the mint API rejects them too); `hackamore policy test` dry-runs one request
 through the real normalize + decide path and reports which rule matched. Audit events
 carry the matched rule index, so every allow/deny is traceable to the rule that
-decided it.
+decided it. For interactive authoring, the **policy studio** web UI (served at `/ui` on
+the admin listener) pairs the catalog explorer with a composer: click an operation to
+add a rule, edit verbs/resources/conditions, watch lint run live, dry-run a request, and
+mint — all backed by the same `/catalogs`, `/policy/lint`, and `/policy/test` admin
+endpoints.
 
 ## Quickstart
 
@@ -101,6 +105,8 @@ cargo run -p cli --bin hackamore -- policy test examples/policy.reviewer-bot.jso
   --flavor github --request "POST /repos/octocat/hello/pulls" --field base=develop
 # edit examples/config.json: set a real credential and your agents' policies
 make run                      # serves proxy on :9090, admin API on :9091
+# open the policy studio (browse the catalog, compose + lint + dry-run + mint a token):
+#   http://127.0.0.1:9091/ui   (admin listener; set "web_ui": false to disable)
 
 # mint a launch token from a policy document (the orchestrator does this at launch)
 cargo run -p cli --bin hackamore -- mint --admin-url http://127.0.0.1:9091 \

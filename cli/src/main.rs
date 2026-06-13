@@ -339,7 +339,11 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let gateway = Gateway::new(control, ServiceRouter::new(services))
         .with_catalogs(catalogs)
-        .with_ca(ca_pem);
+        .with_ca(ca_pem)
+        .with_web_ui(cfg.web_ui);
+    if cfg.web_ui {
+        tracing::info!(url = %format!("http://{}/ui", cfg.admin_addr), "policy studio web UI enabled");
+    }
 
     let proxy_addr = cfg.proxy_addr.parse()?;
     let admin_addr = cfg.admin_addr.parse()?;

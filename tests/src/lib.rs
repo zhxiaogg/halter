@@ -222,10 +222,16 @@ pub async fn start_hackamore_tls_services(
 
 /// Start a hackamore server with an explicit service allowlist, on ephemeral ports.
 pub async fn start_hackamore_services(services: Vec<Service>) -> Harness {
+    start_hackamore_services_opts(services, true).await
+}
+
+/// As [`start_hackamore_services`], but with explicit control over whether the admin
+/// web UI / authoring endpoints are served (so tests can assert the disabled case).
+pub async fn start_hackamore_services_opts(services: Vec<Service>, web_ui: bool) -> Harness {
     let credentials = Arc::new(InMemoryCredentials::new());
     let audit = Arc::new(InMemoryAudit::new());
     let control = Arc::new(ControlPlane::new(credentials.clone(), audit.clone()));
-    let gateway = Gateway::new(control.clone(), ServiceRouter::new(services));
+    let gateway = Gateway::new(control.clone(), ServiceRouter::new(services)).with_web_ui(web_ui);
     let state = Arc::new(ServerState::new(gateway));
 
     let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

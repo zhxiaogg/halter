@@ -39,6 +39,16 @@ pub struct Config {
     /// as one JSON line to this file.
     #[serde(default)]
     pub audit_log: Option<std::path::PathBuf>,
+    /// Whether the admin listener serves the policy-studio web UI and its authoring
+    /// endpoints (`/ui`, `/catalogs`, `/policy/lint`, `/policy/test`). Defaults to on —
+    /// the admin listener is localhost-only operator surface. Set `false` to disable.
+    #[serde(default = "default_true")]
+    pub web_ui: bool,
+}
+
+/// Serde default for `web_ui` (on).
+fn default_true() -> bool {
+    true
 }
 
 /// Paths to the PEM material for TLS termination. Storage/config type.
